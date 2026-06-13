@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Benford's Law + ensemble ML wash-trading detection engine for the Stellar DEX"
 requires-python = ">=3.10"
 
+[project.scripts]
+ledgerlens = "cli:app"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
