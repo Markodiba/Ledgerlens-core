@@ -26,10 +26,8 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 
-from ingestion.data_models import Asset, OrderBookEvent, Trade
+from ingestion.data_models import Trade
 from ingestion.synthetic_data import (
-    NATIVE,
-    USDC,
     _make_trade,
     _random_account,
     generate_synthetic_dataset,
@@ -97,9 +95,7 @@ def generate_adversarial_dataset(
         }
 
     wash_trades: list[Trade] = []
-    wash_events: list[OrderBookEvent] = []
     trade_id = int(normal_trades_df["id"].astype(int).max()) + 1 if not normal_trades_df.empty else 1
-    event_id = 1
 
     for _ in range(n_wash_rings):
         ring_accounts = [_random_account(rng) for _ in range(ring_size)]

@@ -7,7 +7,6 @@ from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_data
 from detection.adversarial_features import (
     ADVERSARIAL_FEATURE_NAMES,
     compute_adversarial_features,
-    benford_conformity_suspicion,
     temporal_regularity_score,
     counterparty_rotation_index,
     decoy_trade_signature,
