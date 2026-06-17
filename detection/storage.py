@@ -26,6 +26,17 @@ CREATE TABLE IF NOT EXISTS risk_scores (
 );
 CREATE INDEX IF NOT EXISTS idx_risk_scores_wallet ON risk_scores (wallet);
 CREATE INDEX IF NOT EXISTS idx_risk_scores_asset_pair ON risk_scores (asset_pair);
+CREATE TABLE IF NOT EXISTS pair_correlations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_a TEXT NOT NULL,
+    pair_b TEXT NOT NULL,
+    correlation_r REAL NOT NULL,
+    method TEXT NOT NULL,
+    shared_wallet_count INTEGER NOT NULL,
+    timestamp TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_a ON pair_correlations (pair_a);
+CREATE INDEX IF NOT EXISTS idx_pair_correlations_pair_b ON pair_correlations (pair_b);
 """
 
 
@@ -161,6 +172,68 @@ def get_latest_scores(
 
     return [_row_to_score(row) for row in rows]
 
+
+
+def save_pair_correlations(
+    correlations: list[tuple[str, str, float]],
+    method: str,
+    shared_wallet_counts: dict[tuple[str, str], int] | None = None,
+    db_path: str | None = None,
+) -> None:
+    """Persist correlated pair results from the latest pipeline run."""
+    if not correlations:
+        return
+    init_db(db_path)
+    shared_wallet_counts = shared_wallet_counts or {}
+    ts = datetime.utcnow().isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO pair_correlations
+                (pair_a, pair_b, correlation_r, method, shared_wallet_count, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    pair_a,
+                    pair_b,
+                    correlation_r,
+                    method,
+                    shared_wallet_counts.get((pair_a, pair_b), 0),
+                    ts,
+                )
+                for pair_a, pair_b, correlation_r in correlations
+            ],
+        )
+        conn.commit()
+
+
+def get_pair_correlations(db_path: str | None = None) -> list[dict]:
+    """Return the most recent set of pair correlations."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT pc.pair_a, pc.pair_b, pc.correlation_r, pc.method,
+                   pc.shared_wallet_count, pc.timestamp
+            FROM pair_correlations pc
+            JOIN (
+                SELECT MAX(timestamp) AS max_ts FROM pair_correlations
+            ) latest ON pc.timestamp = latest.max_ts
+            ORDER BY pc.correlation_r DESC
+            """
+        ).fetchall()
+    return [
+        {
+            "pair_a": row[0],
+            "pair_b": row[1],
+            "correlation_r": row[2],
+            "method": row[3],
+            "shared_wallet_count": row[4],
+            "timestamp": row[5],
+        }
+        for row in rows
+    ]
 
 
 if __name__ == "__main__":

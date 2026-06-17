@@ -1,3 +1,4 @@
+import pytest
 import pandas as pd
 
 from detection.feature_engineering import (
@@ -249,3 +250,102 @@ def test_build_feature_vector_returns_all_feature_names():
     features = build_feature_vector(trades, "A", as_of)
 
     assert set(features.keys()) == set(FEATURE_NAMES)
+
+
+# ---------------------------------------------------------------------------
+# Cross-pair feature tests
+# ---------------------------------------------------------------------------
+
+
+def _make_pair_trades(
+    times: list[pd.Timestamp],
+    amounts: list[float],
+    wallet: str = "W1",
+    counter: str = "W2",
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ledger_close_time": times,
+            "base_account": wallet,
+            "counter_account": counter,
+            "base_amount": amounts,
+            "base_asset": [{"code": "XLM", "issuer": None}] * len(times),
+            "counter_asset": [{"code": "USDC", "issuer": "GISSUER"}] * len(times),
+        }
+    )
+
+
+def test_cross_pair_features_zero_when_no_cross_pair_data():
+    from detection.feature_engineering import cross_pair_features, CROSS_PAIR_FEATURE_NAMES
+
+    result = cross_pair_features("W1", None, None, None)
+    assert set(result.keys()) == set(CROSS_PAIR_FEATURE_NAMES)
+    assert all(v == 0.0 for v in result.values())
+
+
+def test_cross_pair_activity_count_for_burst_wallet():
+    from detection.feature_engineering import cross_pair_features
+
+    base = pd.Timestamp("2026-06-12T00:00:00Z")
+    t = base
+
+    df_a = _make_pair_trades([t], [100.0], "W1", "W2")
+    df_b = _make_pair_trades([t + pd.Timedelta(minutes=3)], [80.0], "W1", "W3")
+
+    trades_by_pair = {"XLM/USDC": df_a, "XLM/AQUA": df_b}
+    correlated = [("XLM/USDC", "XLM/AQUA", 0.9)]
+    cross_wallets = {"W1": ["XLM/USDC", "XLM/AQUA"]}
+
+    result = cross_pair_features("W1", trades_by_pair, correlated, cross_wallets)
+
+    assert result["cross_pair_activity_count"] == 2.0
+    assert result["cross_pair_synchrony_score"] == pytest.approx(0.9)
+
+
+def test_non_burst_wallet_has_zero_cross_pair_features():
+    from detection.feature_engineering import cross_pair_features
+
+    base = pd.Timestamp("2026-06-12T00:00:00Z")
+    t = base
+
+    df_a = _make_pair_trades([t], [100.0], "W1", "W2")
+    df_b = _make_pair_trades([t + pd.Timedelta(minutes=3)], [80.0], "W1", "W3")
+
+    trades_by_pair = {"XLM/USDC": df_a, "XLM/AQUA": df_b}
+    correlated = [("XLM/USDC", "XLM/AQUA", 0.9)]
+    cross_wallets = {"W1": ["XLM/USDC", "XLM/AQUA"]}
+
+    # W9 is not in any burst window
+    result = cross_pair_features("W9", trades_by_pair, correlated, cross_wallets)
+    assert result["cross_pair_activity_count"] == 0.0
+    assert result["cross_pair_synchrony_score"] == 0.0
+    assert result["cross_pair_burst_overlap_ratio"] == 0.0
+    assert result["shared_wallet_cluster_size"] == 0.0
+    assert result["cross_pair_volume_concentration"] == 0.0
+
+
+def test_build_feature_vector_with_cross_pair_data():
+    from detection.feature_engineering import FEATURE_NAMES, CROSS_PAIR_FEATURE_NAMES
+
+    base = pd.Timestamp("2026-06-12T00:00:00Z")
+    t = base
+
+    df_a = _make_pair_trades([t - pd.Timedelta(minutes=1)], [100.0], "W1", "W2")
+    df_b = _make_pair_trades([t + pd.Timedelta(minutes=3)], [80.0], "W1", "W3")
+
+    trades_by_pair = {"XLM/USDC": df_a, "XLM/AQUA": df_b}
+    correlated = [("XLM/USDC", "XLM/AQUA", 0.9)]
+    cross_wallets = {"W1": ["XLM/USDC", "XLM/AQUA"]}
+
+    features = build_feature_vector(
+        df_a,
+        "W1",
+        base,
+        trades_by_pair=trades_by_pair,
+        correlated_pairs=correlated,
+        cross_pair_wallets=cross_wallets,
+    )
+
+    assert set(features.keys()) == set(FEATURE_NAMES)
+    for name in CROSS_PAIR_FEATURE_NAMES:
+        assert name in features

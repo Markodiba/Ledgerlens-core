@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from detection.storage import get_latest_scores
+from detection.storage import get_latest_scores, get_pair_correlations
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
@@ -110,6 +110,17 @@ def asset_risk_ranking() -> list[dict]:
         for pair, values in by_pair.items()
     ]
     return sorted(ranking, key=lambda r: r["average_score"], reverse=True)
+
+
+@app.get("/correlations")
+def list_correlations() -> list[dict]:
+    """Return the most recent set of correlated asset pairs from the pipeline.
+
+    Each entry includes the pair names, Spearman correlation coefficient,
+    the method used, the count of shared wallets in burst windows, and the
+    run timestamp.
+    """
+    return get_pair_correlations()
 
 
 # ---------------------------------------------------------------------------

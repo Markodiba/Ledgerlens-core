@@ -13,10 +13,15 @@ from datetime import timedelta
 import pandas as pd
 
 from config.settings import settings
+from detection.cross_pair_engine import (
+    build_volume_time_series,
+    find_correlated_pairs,
+    find_cross_pair_wallets,
+)
 from detection.feature_engineering import build_feature_vector
 from detection.model_inference import load_models, score_feature_vector
 from detection.risk_score import RiskScore
-from detection.storage import save_scores
+from detection.storage import save_pair_correlations, save_scores
 from ingestion.account_loader import load_account_metadata
 from ingestion.historical_loader import load_historical_trades
 from ingestion.operations_loader import load_order_book_events_for_pair
@@ -25,12 +30,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ledgerlens.pipeline")
 
 
-def run(asset_pairs: list[tuple[str | None, str | None]] | None = None) -> list[RiskScore]:
+def run(
+    asset_pairs: list[tuple[str | None, str | None]] | None = None,
+    multi_pair: bool = False,
+) -> list[RiskScore]:
     """Run one scoring pass over the given asset pairs and return the resulting scores.
 
     `asset_pairs` is a list of `(base_asset, counter_asset)` tuples in
     `CODE:ISSUER` form (None for native XLM). Defaults to a single
     XLM/USDC pair for local testing.
+
+    When `multi_pair=True`, trades for all pairs are loaded upfront and
+    cross-asset correlation analysis is performed once across all pairs.
+    The resulting cross-pair features are included in each account's
+    feature vector.
     """
     asset_pairs = asset_pairs or [
         (None, "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
@@ -38,8 +51,41 @@ def run(asset_pairs: list[tuple[str | None, str | None]] | None = None) -> list[
     models = load_models()
     scores: list[RiskScore] = []
 
+    # Pre-load all trades when running in multi-pair mode
+    trades_by_pair: dict[str, pd.DataFrame] = {}
+    correlated_pairs: list[tuple[str, str, float]] = []
+    cross_pair_wallets_map: dict[str, list[str]] = {}
+
+    if multi_pair:
+        for base_asset, counter_asset in asset_pairs:
+            pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+            if not trades.empty:
+                trades_by_pair[pair_key] = trades
+
+        if trades_by_pair:
+            volume_matrix = build_volume_time_series(trades_by_pair)
+            correlated_pairs = find_correlated_pairs(volume_matrix)
+            cross_pair_wallets_map = find_cross_pair_wallets(trades_by_pair, correlated_pairs)
+
+            shared_counts: dict[tuple[str, str], int] = {}
+            for pa, pb, _ in correlated_pairs:
+                count = sum(
+                    1 for w_pairs in cross_pair_wallets_map.values()
+                    if pa in w_pairs and pb in w_pairs
+                )
+                shared_counts[(pa, pb)] = count
+            save_pair_correlations(correlated_pairs, "spearman", shared_counts)
+            logger.info("Found %d correlated pair combinations", len(correlated_pairs))
+
     for base_asset, counter_asset in asset_pairs:
-        trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+        pair_key = f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}"
+
+        if multi_pair:
+            trades = trades_by_pair.get(pair_key, pd.DataFrame())
+        else:
+            trades = load_historical_trades(base_asset=base_asset, counter_asset=counter_asset)
+
         if trades.empty:
             logger.info("No trades found for %s/%s", base_asset, counter_asset)
             continue
@@ -61,12 +107,15 @@ def run(asset_pairs: list[tuple[str | None, str | None]] | None = None) -> list[
                 as_of,
                 order_book_events=order_book_events,
                 account_metadata=account_metadata,
+                trades_by_pair=trades_by_pair if multi_pair else None,
+                correlated_pairs=correlated_pairs if multi_pair else None,
+                cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
             )
             probability, confidence = score_feature_vector(models, features)
 
             score = RiskScore.combine(
                 wallet=account,
-                asset_pair=f"{base_asset or 'XLM'}/{counter_asset or 'XLM'}",
+                asset_pair=pair_key,
                 benford_mad=features.get("benford_mad_24h", 0.0),
                 benford_mad_threshold=settings.benford_mad_threshold,
                 ml_probability=probability,

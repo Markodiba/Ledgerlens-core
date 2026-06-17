@@ -355,3 +355,62 @@ def test_limit_offset_out_of_range_returns_422(client):
 
     resp = client.get("/scores?limit=10&offset=-1")
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /correlations
+# ---------------------------------------------------------------------------
+
+
+def test_correlations_empty(client):
+    resp = client.get("/correlations")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_correlations_returns_stored_data(client, monkeypatch):
+    import detection.storage as storage_module
+
+    storage_module.save_pair_correlations(
+        [("XLM/USDC", "XLM/AQUA", 0.88)],
+        method="spearman",
+        shared_wallet_counts={("XLM/USDC", "XLM/AQUA"): 3},
+        db_path=storage_module.settings.db_path,
+    )
+
+    resp = client.get("/correlations")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    row = body[0]
+    assert row["pair_a"] == "XLM/USDC"
+    assert row["pair_b"] == "XLM/AQUA"
+    assert abs(row["correlation_r"] - 0.88) < 1e-6
+    assert row["method"] == "spearman"
+    assert row["shared_wallet_count"] == 3
+
+
+def test_correlations_returns_only_latest_run(client, monkeypatch):
+    import time as _time
+
+    import detection.storage as storage_module
+
+    db = storage_module.settings.db_path
+
+    storage_module.save_pair_correlations(
+        [("XLM/USDC", "XLM/AQUA", 0.80)],
+        method="spearman",
+        db_path=db,
+    )
+    _time.sleep(0.01)
+    storage_module.save_pair_correlations(
+        [("XLM/USDC", "XLM/yXLM", 0.91)],
+        method="spearman",
+        db_path=db,
+    )
+
+    resp = client.get("/correlations")
+    body = resp.json()
+    pairs = {(r["pair_a"], r["pair_b"]) for r in body}
+    assert ("XLM/USDC", "XLM/yXLM") in pairs
+    assert ("XLM/USDC", "XLM/AQUA") not in pairs

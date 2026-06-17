@@ -50,8 +50,20 @@ WALLET_GRAPH_FEATURE_NAMES = [
     "account_age_days",
 ]
 
+CROSS_PAIR_FEATURE_NAMES = [
+    "cross_pair_activity_count",
+    "cross_pair_synchrony_score",
+    "cross_pair_burst_overlap_ratio",
+    "shared_wallet_cluster_size",
+    "cross_pair_volume_concentration",
+]
+
 FEATURE_NAMES = (
-    BENFORD_FEATURE_NAMES + TRADE_PATTERN_FEATURE_NAMES + VOLUME_TIMING_FEATURE_NAMES + WALLET_GRAPH_FEATURE_NAMES
+    BENFORD_FEATURE_NAMES
+    + TRADE_PATTERN_FEATURE_NAMES
+    + VOLUME_TIMING_FEATURE_NAMES
+    + WALLET_GRAPH_FEATURE_NAMES
+    + CROSS_PAIR_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -261,12 +273,101 @@ def account_age_days(account: str, as_of: pd.Timestamp, account_metadata: dict[s
     return float((as_of - pd.Timestamp(created_at)).total_seconds() / 86400)
 
 
+def cross_pair_features(
+    account: str,
+    trades_by_pair: dict[str, pd.DataFrame] | None,
+    correlated_pairs: list[tuple[str, str, float]] | None,
+    cross_pair_wallets: dict[str, list[str]] | None,
+) -> dict:
+    """Compute the five cross-pair features for `account`.
+
+    All inputs are optional; omitting any yields 0.0 for all five features.
+    """
+    zero = {name: 0.0 for name in CROSS_PAIR_FEATURE_NAMES}
+
+    if not trades_by_pair or not correlated_pairs or not cross_pair_wallets:
+        return zero
+
+    wallet_active_pairs = cross_pair_wallets.get(account)
+    if not wallet_active_pairs:
+        return zero
+
+    active_count = len(wallet_active_pairs)
+
+    # Maximum Spearman r between the wallet's two most-correlated pairs
+    pair_set = set(wallet_active_pairs)
+    max_r = 0.0
+    for pa, pb, r in correlated_pairs:
+        if pa in pair_set and pb in pair_set:
+            max_r = max(max_r, r)
+
+    # Fraction of wallet trades that fall in cross-pair burst windows (10-min)
+    total_trades = 0
+    burst_trades = 0
+    window = pd.Timedelta(minutes=10)
+    window_us = window.value // 1_000  # microseconds
+    for pair in wallet_active_pairs:
+        df = trades_by_pair.get(pair, pd.DataFrame())
+        if df.empty:
+            continue
+        acct_df = df[(df["base_account"] == account) | (df["counter_account"] == account)]
+        total_trades += len(acct_df)
+        other_pairs = [p for p in wallet_active_pairs if p != pair]
+        for other_pair in other_pairs:
+            df_other = trades_by_pair.get(other_pair, pd.DataFrame())
+            if df_other.empty:
+                continue
+            times_other_us = pd.to_datetime(
+                df_other["ledger_close_time"].values, utc=True
+            ).as_unit("us").asi8
+            for _, row in acct_df.iterrows():
+                t_us = int(pd.Timestamp(row["ledger_close_time"]).value // 1_000)
+                if any(abs(int(to) - t_us) <= window_us for to in times_other_us):
+                    burst_trades += 1
+                    break
+
+    burst_overlap = burst_trades / total_trades if total_trades > 0 else 0.0
+
+    # Number of other wallets in the same correlated burst cluster
+    shared_cluster_size = sum(
+        1 for w, w_pairs in cross_pair_wallets.items()
+        if w != account and set(w_pairs) & pair_set
+    )
+
+    # Wallet's fraction of total cross-pair burst volume
+    wallet_burst_vol = 0.0
+    total_burst_vol = 0.0
+    for pair in wallet_active_pairs:
+        df = trades_by_pair.get(pair, pd.DataFrame())
+        if df.empty:
+            continue
+        acct_vol = df[
+            (df["base_account"] == account) | (df["counter_account"] == account)
+        ]["base_amount"].sum()
+        total_vol = df["base_amount"].sum()
+        wallet_burst_vol += acct_vol
+        total_burst_vol += total_vol
+
+    vol_concentration = wallet_burst_vol / total_burst_vol if total_burst_vol > 0 else 0.0
+
+    return {
+        "cross_pair_activity_count": float(active_count),
+        "cross_pair_synchrony_score": float(max_r),
+        "cross_pair_burst_overlap_ratio": float(burst_overlap),
+        "shared_wallet_cluster_size": float(shared_cluster_size),
+        "cross_pair_volume_concentration": float(vol_concentration),
+    }
+
+
 def build_feature_vector(
     trades: pd.DataFrame,
     account: str,
     as_of: pd.Timestamp,
     order_book_events: pd.DataFrame | None = None,
     account_metadata: dict[str, dict] | None = None,
+    trades_by_pair: dict[str, pd.DataFrame] | None = None,
+    correlated_pairs: list[tuple[str, str, float]] | None = None,
+    cross_pair_wallets: dict[str, list[str]] | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -276,6 +377,10 @@ def build_feature_vector(
     `account_metadata` (from `ingestion.account_loader.load_account_metadata`)
     are optional; omitting them yields `0.0` for the features that depend
     on them rather than raising.
+
+    `trades_by_pair`, `correlated_pairs`, and `cross_pair_wallets` are
+    produced by the cross-pair engine and are optional; omitting them yields
+    `0.0` for all five cross-pair features.
     """
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
@@ -296,6 +401,7 @@ def build_feature_vector(
             "account_age_days": account_age_days(account, as_of, account_metadata),
         }
     )
+    features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features
