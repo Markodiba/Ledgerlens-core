@@ -218,7 +218,7 @@ def save_pair_correlations(
         return
     init_db(db_path)
     shared_wallet_counts = shared_wallet_counts or {}
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         conn.executemany(
             """

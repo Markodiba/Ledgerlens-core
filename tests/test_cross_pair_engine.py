@@ -4,7 +4,6 @@ import time
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from detection.cross_pair_engine import (
     build_volume_time_series,
