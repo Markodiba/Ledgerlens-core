@@ -21,8 +21,14 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from config.settings import settings
+from detection.amm_engine import pool_risk_from_trade_rows
 from detection.risk_score import RiskScore
-from detection.storage import get_latest_scores, get_pair_correlations
+from detection.storage import (
+    get_circular_routes,
+    get_latest_scores,
+    get_liquidity_pool_trades,
+    get_pair_correlations,
+)
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
 
@@ -121,6 +127,29 @@ def list_correlations() -> list[dict]:
     run timestamp.
     """
     return get_pair_correlations()
+
+
+@app.get("/amm/pools/{pool_id}/risk")
+def pool_risk(pool_id: str) -> dict:
+    """Return pool-level round-trip ratio and trader concentration for `pool_id`.
+
+    Based on AMM pool trades ingested by `run_pipeline.py` (see
+    `ingestion.amm_loader`) and stored in `liquidity_pool_trades`.
+    """
+    rows = get_liquidity_pool_trades(pool_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No pool trades found for pool {pool_id}")
+    risk = pool_risk_from_trade_rows(rows)
+    return {"pool_id": pool_id, **risk}
+
+
+@app.get("/path-payments/circular")
+def circular_path_payments(
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict]:
+    """Return detected atomic circular path-payment routes, paginated."""
+    return get_circular_routes(limit=limit, offset=offset)
 
 
 # ---------------------------------------------------------------------------

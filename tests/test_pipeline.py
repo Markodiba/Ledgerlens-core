@@ -53,6 +53,7 @@ def test_run_persists_scores(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_historical_trades", lambda **kwargs: trades)
     monkeypatch.setattr(run_pipeline, "load_account_metadata", lambda accounts: account_metadata)
     monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", fake_load_order_book_events_for_pair)
+    monkeypatch.setattr(run_pipeline, "load_path_payments_for_accounts", lambda accounts, since: [])
 
     scores = run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
 
@@ -78,6 +79,7 @@ def test_submit_batch_called_for_high_risk_scores(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_historical_trades", lambda **kwargs: trades)
     monkeypatch.setattr(run_pipeline, "load_account_metadata", lambda accounts: account_metadata)
     monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", lambda base, counter, since: [])
+    monkeypatch.setattr(run_pipeline, "load_path_payments_for_accounts", lambda accounts, since: [])
 
     import config.settings as settings_module
 
@@ -105,6 +107,7 @@ def test_no_submit_flag_skips_on_chain(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_historical_trades", lambda **kwargs: trades)
     monkeypatch.setattr(run_pipeline, "load_account_metadata", lambda accounts: account_metadata)
     monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", lambda base, counter, since: [])
+    monkeypatch.setattr(run_pipeline, "load_path_payments_for_accounts", lambda accounts, since: [])
 
     import config.settings as settings_module
 
@@ -129,6 +132,7 @@ def test_submit_skipped_when_not_configured(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_historical_trades", lambda **kwargs: trades)
     monkeypatch.setattr(run_pipeline, "load_account_metadata", lambda accounts: account_metadata)
     monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", lambda base, counter, since: [])
+    monkeypatch.setattr(run_pipeline, "load_path_payments_for_accounts", lambda accounts, since: [])
 
     # Ensure Soroban settings are empty (reset from any earlier test)
     object.__setattr__(settings_module.settings, "score_contract_id", "")
@@ -150,6 +154,7 @@ def test_run_records_scored_features(model_dir, monkeypatch):
     monkeypatch.setattr(run_pipeline, "load_historical_trades", lambda **kwargs: trades)
     monkeypatch.setattr(run_pipeline, "load_account_metadata", lambda accounts: account_metadata)
     monkeypatch.setattr(run_pipeline, "load_order_book_events_for_pair", lambda base, counter, since: [])
+    monkeypatch.setattr(run_pipeline, "load_path_payments_for_accounts", lambda accounts, since: [])
 
     with patch("run_pipeline.record_scored_features") as mock_record:
         run_pipeline.run(asset_pairs=[(None, "USDC:ISSUER")])
@@ -184,9 +189,13 @@ def test_async_run_records_scored_features(model_dir, monkeypatch):
     async def fake_async_order_book(*args, **kwargs):
         return []
 
+    async def fake_async_path_payments(*args, **kwargs):
+        return []
+
     monkeypatch.setattr(run_pipeline, "async_load_historical_trades", fake_async_load)
     monkeypatch.setattr(run_pipeline, "async_load_account_metadata", fake_async_metadata)
     monkeypatch.setattr(run_pipeline, "async_load_order_book_events_for_pair", fake_async_order_book)
+    monkeypatch.setattr(run_pipeline, "async_load_path_payments", fake_async_path_payments)
 
     with patch("run_pipeline.record_scored_features") as mock_record:
         asyncio.run(run_pipeline.async_run(asset_pairs=[(None, "USDC:ISSUER")]))

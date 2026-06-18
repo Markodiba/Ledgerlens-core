@@ -161,8 +161,11 @@ def find_cross_pair_wallets(
         if df_a is None or df_b is None or df_a.empty or df_b.empty:
             continue
 
-        wallets_a = set(df_a["base_account"]) | set(df_a["counter_account"])
-        wallets_b = set(df_b["base_account"]) | set(df_b["counter_account"])
+        # Pool trades carry counter_account=None (the pool has no wallet); drop it
+        # so two unrelated pairs that both trade against pools don't appear to
+        # share a "wallet" called None.
+        wallets_a = set(df_a["base_account"]) | set(df_a["counter_account"].dropna())
+        wallets_b = set(df_b["base_account"]) | set(df_b["counter_account"].dropna())
         shared_wallets = wallets_a & wallets_b
 
         for wallet in shared_wallets:

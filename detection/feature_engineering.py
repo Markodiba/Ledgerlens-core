@@ -11,7 +11,10 @@ account-metadata inputs are optional and come from
 
 import pandas as pd
 
+from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
 from detection.benford_engine import compute_benford_metrics
+from detection.path_payment_engine import detect_atomic_circular_routes
+from ingestion.data_models import LiquidityPool, PathPayment, TradeType
 
 ROLLING_WINDOWS = {
     "1h": pd.Timedelta(hours=1),
@@ -58,12 +61,26 @@ CROSS_PAIR_FEATURE_NAMES = [
     "cross_pair_volume_concentration",
 ]
 
+AMM_FEATURE_NAMES = [
+    "pool_trade_ratio",  # fraction of an account's volume that is pool, not orderbook
+    "pool_round_trip_ratio",
+    "pool_share_concentration",
+]
+
+PATH_PAYMENT_FEATURE_NAMES = [
+    "atomic_self_payment_ratio",  # fraction of an account's path payments where source==destination
+    "avg_path_hop_count",
+    "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
     + VOLUME_TIMING_FEATURE_NAMES
     + WALLET_GRAPH_FEATURE_NAMES
     + CROSS_PAIR_FEATURE_NAMES
+    + AMM_FEATURE_NAMES
+    + PATH_PAYMENT_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -252,8 +269,11 @@ def network_centrality(trades: pd.DataFrame, account: str) -> float:
     """Degree centrality of `account` within the trading graph induced by `trades`.
 
     Defined as `account`'s unique counterparties divided by `(total accounts - 1)`.
+    Pool trades have no counterparty wallet (`counter_account` is `None`) and
+    are excluded from the account universe rather than counted as a node.
     """
     all_accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
+    all_accounts = all_accounts[pd.notna(all_accounts)]
     if len(all_accounts) <= 1:
         return 0.0
 
@@ -359,6 +379,81 @@ def cross_pair_features(
     }
 
 
+def amm_features(
+    trades: pd.DataFrame,
+    account: str,
+    liquidity_pools: dict[str, LiquidityPool] | None = None,
+    pool_deposits: dict[str, pd.DataFrame] | None = None,
+) -> dict:
+    """Compute the three AMM pool features for `account`.
+
+    `pool_trade_ratio` and `pool_round_trip_ratio` are derived from `trades`
+    alone (rows with `trade_type == LIQUIDITY_POOL`). `pool_share_concentration`
+    additionally needs `liquidity_pools` (id -> `LiquidityPool`) and
+    `pool_deposits` (id -> deposit/withdraw DataFrame); omitting either yields
+    `0.0` for that feature.
+    """
+    zero = {name: 0.0 for name in AMM_FEATURE_NAMES}
+    if trades.empty or "trade_type" not in trades.columns:
+        return zero
+
+    account_trades = _account_trades(trades, account)
+    if account_trades.empty:
+        return zero
+
+    pool_trades = account_trades.loc[account_trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+    if pool_trades.empty:
+        return zero
+
+    total_volume = account_trades["base_amount"].sum()
+    pool_trade_ratio = float(pool_trades["base_amount"].sum() / total_volume) if total_volume > 0 else 0.0
+
+    pool_ids = [pid for pid in pool_trades["liquidity_pool_id"].dropna().unique()]
+    round_trip_ratios = [pool_round_trip_ratio(trades, account, pid) for pid in pool_ids]
+    avg_round_trip = float(sum(round_trip_ratios) / len(round_trip_ratios)) if round_trip_ratios else 0.0
+
+    concentrations = []
+    if liquidity_pools and pool_deposits:
+        for pid in pool_ids:
+            pool = liquidity_pools.get(pid)
+            deposits = pool_deposits.get(pid)
+            if pool is not None and deposits is not None:
+                concentrations.append(pool_share_concentration(pool, deposits))
+    avg_concentration = float(sum(concentrations) / len(concentrations)) if concentrations else 0.0
+
+    return {
+        "pool_trade_ratio": pool_trade_ratio,
+        "pool_round_trip_ratio": avg_round_trip,
+        "pool_share_concentration": avg_concentration,
+    }
+
+
+def path_payment_features(path_payments: list[PathPayment] | None, account: str) -> dict:
+    """Compute the three path-payment features for `account`'s own payments
+    (`source_account == account`). Omitting `path_payments` yields `0.0`.
+    """
+    zero = {name: 0.0 for name in PATH_PAYMENT_FEATURE_NAMES}
+    if not path_payments:
+        return zero
+
+    own_payments = [p for p in path_payments if p.source_account == account]
+    if not own_payments:
+        return zero
+
+    routes = detect_atomic_circular_routes(own_payments)
+    self_payment_count = sum(1 for r in routes if r["is_atomic_self_payment"])
+    cycle_volume = sum(r["cycle_volume"] for r in routes if not r["is_atomic_self_payment"])
+
+    total_volume = sum(p.source_amount for p in own_payments)
+    hop_counts = [len(p.path) + 1 for p in own_payments]
+
+    return {
+        "atomic_self_payment_ratio": float(self_payment_count / len(own_payments)),
+        "avg_path_hop_count": float(sum(hop_counts) / len(hop_counts)),
+        "path_cycle_volume_ratio": float(cycle_volume / total_volume) if total_volume > 0 else 0.0,
+    }
+
+
 def build_feature_vector(
     trades: pd.DataFrame,
     account: str,
@@ -368,11 +463,16 @@ def build_feature_vector(
     trades_by_pair: dict[str, pd.DataFrame] | None = None,
     correlated_pairs: list[tuple[str, str, float]] | None = None,
     cross_pair_wallets: dict[str, list[str]] | None = None,
+    liquidity_pools: dict[str, LiquidityPool] | None = None,
+    pool_deposits: dict[str, pd.DataFrame] | None = None,
+    path_payments: list[PathPayment] | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
     `trades` should already be filtered to the relevant asset pair / time
-    range covering the largest rolling window. `order_book_events` (from
+    range covering the largest rolling window, and may include AMM pool
+    trades (`trade_type == LIQUIDITY_POOL`, `counter_account is None`)
+    alongside order-book trades. `order_book_events` (from
     `ingestion.operations_loader.load_order_book_events_for_pair`) and
     `account_metadata` (from `ingestion.account_loader.load_account_metadata`)
     are optional; omitting them yields `0.0` for the features that depend
@@ -381,6 +481,10 @@ def build_feature_vector(
     `trades_by_pair`, `correlated_pairs`, and `cross_pair_wallets` are
     produced by the cross-pair engine and are optional; omitting them yields
     `0.0` for all five cross-pair features.
+
+    `liquidity_pools`, `pool_deposits`, and `path_payments` are optional;
+    omitting them yields `0.0` for the AMM/path-payment features that depend
+    on them.
     """
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
@@ -402,6 +506,8 @@ def build_feature_vector(
         }
     )
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
+    features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
+    features.update(path_payment_features(path_payments, account))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features
