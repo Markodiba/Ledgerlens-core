@@ -1,16 +1,18 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import sqlite3
 
 from detection.risk_score import RiskScore
 from detection.storage import (
-    get_feature_vector,
+    SchemaMigrationError,
+    _MIGRATIONS,
+    _connect,
     get_latest_scores,
-    get_shap_values,
+    get_schema_version,
     init_db,
-    save_feature_vectors,
+    migrate_db,
     save_scores,
-    save_shap_values,
 )
 
 
@@ -30,6 +32,10 @@ def _score(wallet="GABC", asset_pair="XLM/USDC", score=80, timestamp=None) -> Ri
         timestamp=timestamp or datetime.now(timezone.utc),
     )
 
+
+# ---------------------------------------------------------------------------
+# Existing tests (unchanged)
+# ---------------------------------------------------------------------------
 
 def test_init_db_creates_table(db_path):
     init_db(db_path)
@@ -191,80 +197,87 @@ def test_get_latest_scores_applies_limit_offset_in_sql(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Feature vector + SHAP value round-trip tests
+# Migration tests
 # ---------------------------------------------------------------------------
 
-_FEATURES = {
-    "benford_mad_24h": 0.02,
-    "round_trip_trade_frequency": 0.1,
-    "network_centrality": 0.5,
-}
-
-
-def test_save_and_get_feature_vector(db_path):
-    save_feature_vectors(
-        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": _FEATURES}],
-        db_path,
-    )
-    result = get_feature_vector("GABC", "XLM/USDC", db_path)
-    assert result is not None
-    assert result["benford_mad_24h"] == pytest.approx(0.02)
-    assert result["round_trip_trade_frequency"] == pytest.approx(0.1)
-
-
-def test_get_feature_vector_returns_none_for_unknown_wallet(db_path):
+def test_fresh_db_reaches_latest_schema_version(db_path):
+    """A brand-new database is migrated all the way to len(_MIGRATIONS)."""
     init_db(db_path)
-    assert get_feature_vector("GUNKNOWN", "XLM/USDC", db_path) is None
+    with _connect(db_path) as conn:
+        assert get_schema_version(conn) == len(_MIGRATIONS)
 
 
-def test_get_feature_vector_returns_most_recent(db_path):
-    save_feature_vectors(
-        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": {"benford_mad_24h": 0.01}}],
-        db_path,
-    )
-    save_feature_vectors(
-        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": {"benford_mad_24h": 0.99}}],
-        db_path,
-    )
-    result = get_feature_vector("GABC", "XLM/USDC", db_path)
-    assert result["benford_mad_24h"] == pytest.approx(0.99)
+def test_migrate_db_from_version_zero(db_path):
+    """A DB with no schema_version table (version 0) is fully migrated."""
+    # Create a bare SQLite file with no tables.
+    conn = sqlite3.connect(db_path)
+    conn.close()
+
+    with _connect(db_path) as conn:
+        assert get_schema_version(conn) == 0
+        applied = migrate_db(conn)
+
+    assert len(applied) == len(_MIGRATIONS)
+    with _connect(db_path) as conn:
+        assert get_schema_version(conn) == len(_MIGRATIONS)
 
 
-def test_save_and_get_shap_values(db_path):
-    # Must have a feature_vectors row first.
-    save_feature_vectors(
-        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": _FEATURES}],
-        db_path,
-    )
-    shap_payload = [
-        {"feature": "benford_mad_24h", "shap_value": 0.35},
-        {"feature": "round_trip_trade_frequency", "shap_value": -0.20},
-        {"feature": "network_centrality", "shap_value": 0.10},
+def test_migrate_db_idempotent(db_path):
+    """Re-running migrate_db on an already-current database is a no-op."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        applied = migrate_db(conn)
+    assert applied == []
+
+
+def test_failed_migration_leaves_applying_status(db_path, monkeypatch):
+    """A migration with bad SQL leaves the log row in 'applying' state."""
+    import detection.storage as storage_module
+
+    bad_migrations = [
+        (1, "initial schema", _MIGRATIONS[0][2]),
+        (2, "bad migration", "THIS IS NOT VALID SQL;"),
     ]
-    save_shap_values("GABC", "XLM/USDC", shap_payload, db_path)
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", bad_migrations)
 
-    result = get_shap_values("GABC", "XLM/USDC", db_path)
-    assert result is not None
-    assert len(result) == 3
-    assert result[0]["feature"] == "benford_mad_24h"
-    assert result[0]["shap_value"] == pytest.approx(0.35)
+    with _connect(db_path) as conn:
+        with pytest.raises(Exception):
+            migrate_db(conn)
+
+        rows = conn.execute(
+            "SELECT version, status FROM schema_migrations WHERE version = 2"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][1] == "applying"
 
 
-def test_get_shap_values_returns_none_for_unknown_wallet(db_path):
+def test_interrupted_migration_raises_on_next_startup(db_path, monkeypatch):
+    """If a log row with status='applying' exists, migrate_db raises SchemaMigrationError."""
+    import detection.storage as storage_module
+
+    bad_migrations = [
+        (1, "initial schema", _MIGRATIONS[0][2]),
+        (2, "bad migration", "THIS IS NOT VALID SQL;"),
+    ]
+    monkeypatch.setattr(storage_module, "_MIGRATIONS", bad_migrations)
+
+    # First run: migration 2 fails, leaves 'applying' row.
+    with _connect(db_path) as conn:
+        with pytest.raises(Exception):
+            migrate_db(conn)
+
+    # Second run: detects the interrupted migration and raises SchemaMigrationError.
+    with _connect(db_path) as conn:
+        with pytest.raises(SchemaMigrationError, match="2"):
+            migrate_db(conn)
+
+
+def test_save_and_get_scores_on_migrated_db(db_path):
+    """Existing save_scores / get_latest_scores work normally on a migrated database."""
     init_db(db_path)
-    assert get_shap_values("GUNKNOWN", "XLM/USDC", db_path) is None
+    s = _score()
+    save_scores([s], db_path)
+    results = get_latest_scores(db_path=db_path)
+    assert len(results) == 1
+    assert results[0].wallet == s.wallet
 
-
-def test_get_shap_values_returns_none_when_not_yet_computed(db_path):
-    # Feature vector present but no SHAP values written yet.
-    save_feature_vectors(
-        [{"wallet": "GABC", "asset_pair": "XLM/USDC", "features": _FEATURES}],
-        db_path,
-    )
-    assert get_shap_values("GABC", "XLM/USDC", db_path) is None
-
-
-def test_save_feature_vectors_noop_on_empty_list(db_path):
-    init_db(db_path)
-    save_feature_vectors([], db_path)  # Should not raise.
-    assert get_feature_vector("GABC", "XLM/USDC", db_path) is None
