@@ -35,6 +35,14 @@ class Settings:
     soroban_circuit_breaker_threshold: int = field(default_factory=lambda: int(os.getenv("SOROBAN_CIRCUIT_BREAKER_THRESHOLD", "5")))
     soroban_circuit_reset_seconds: int = field(default_factory=lambda: int(os.getenv("SOROBAN_CIRCUIT_RESET_SECONDS", "300")))
 
+    cors_allowed_origins: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            o.strip()
+            for o in os.getenv("LEDGERLENS_CORS_ALLOWED_ORIGINS", "").split(",")
+            if o.strip()
+        )
+    )
+
     def __post_init__(self) -> None:
         weights = (
             self.ensemble_weight_rf,
@@ -45,6 +53,11 @@ class Settings:
             raise ValueError("Ensemble weights must be non-negative")
         if all(weight == 0 for weight in weights):
             raise ValueError("At least one ensemble weight must be positive")
+        if "*" in self.cors_allowed_origins:
+            raise ValueError(
+                "LEDGERLENS_CORS_ALLOWED_ORIGINS must not contain '*'. "
+                "Specify an explicit origin list instead."
+            )
 
 
 settings = Settings()
