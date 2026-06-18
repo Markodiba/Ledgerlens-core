@@ -136,29 +136,6 @@ def wallet_scores(wallet: str) -> list[RiskScore]:
     if not scores:
         raise HTTPException(status_code=404, detail=f"No scores found for wallet {wallet}")
     return scores
-def explain_wallet_score(
-    wallet: str,
-    asset_pair: str = Query(..., description="Asset pair to explain, e.g. XLM/USDC"),
-) -> list[dict]:
-    """Return the top-5 SHAP feature contributions for ``wallet`` on ``asset_pair``.
-
-    Response schema: list of ``{"feature": str, "shap_value": float}`` ordered
-    by absolute SHAP contribution descending.
-
-    - **200** — cache hit: returns up to 5 feature contributions.
-    - **404** — no SHAP cache found for the given wallet / asset pair combination.
-    - **503** — models were not loaded at startup (run the training pipeline first).
-    """
-    if not _models:
-        raise HTTPException(status_code=503, detail="Models not loaded")
-
-    cached = get_shap_values(wallet=wallet, asset_pair=asset_pair)
-    if cached is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
-        )
-    return cached
 
 
 @app.get("/alerts", response_model=list[RiskScore])
