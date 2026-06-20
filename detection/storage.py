@@ -182,19 +182,21 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
     ),
     (
         6,
-        "add wash_rings table",
+        "add robustness_reports table for adversarial evaluation",
         """
-        CREATE TABLE IF NOT EXISTS wash_rings (
+        CREATE TABLE IF NOT EXISTS robustness_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            accounts_json TEXT NOT NULL,
-            total_volume REAL NOT NULL,
-            cycle_volume REAL NOT NULL,
-            avg_trade_count REAL NOT NULL,
-            timing_tightness REAL NOT NULL,
-            truncated INTEGER NOT NULL,
-            detected_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            asr_json TEXT NOT NULL,
+            mean_map REAL NOT NULL,
+            p95_map REAL NOT NULL,
+            certified_radius REAL NOT NULL,
+            n_samples INTEGER NOT NULL,
+            epsilon REAL NOT NULL,
+            report_json TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_wash_rings_detected_at ON wash_rings (detected_at);
+        CREATE INDEX IF NOT EXISTS idx_robustness_reports_created_at ON robustness_reports (created_at);
         """,
     ),
 ]
@@ -776,6 +778,43 @@ def get_retrain_runs(
             tuple(params),
         ).fetchall()
     return [_row_to_retrain_run(row) for row in rows]
+
+
+def save_robustness_report(report: dict, db_path: str | None = None) -> None:
+    """Persist a robustness report dict to the robustness_reports table."""
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO robustness_reports
+                (created_at, model_version, asr_json, mean_map, p95_map, certified_radius, n_samples, epsilon, report_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                report.get("model_version", ""),
+                json.dumps(report.get("asr", {})),
+                float(report.get("mean_map", 0.0)),
+                float(report.get("p95_map", 0.0)),
+                float(report.get("certified_radius", 0.0)),
+                int(report.get("n_samples", 0)),
+                float(report.get("epsilon", 0.0)),
+                json.dumps(report),
+            ),
+        )
+        conn.commit()
+
+
+def get_latest_robustness_report(db_path: str | None = None) -> dict | None:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT report_json FROM robustness_reports ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0])
 
 
 def _asset_pair_symbol(asset: dict) -> str:

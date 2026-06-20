@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from api.auth import require_admin_key
 from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
+from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
 from detection.storage import (
     get_circular_routes,
@@ -275,6 +276,79 @@ def circular_path_payments(
 
 
 # ---------------------------------------------------------------------------
+# Feedback ingestion — admin-key gated
+# ---------------------------------------------------------------------------
+
+
+class FeedbackRequest(BaseModel):
+    wallet: str
+    asset_pair: str
+    ground_truth: int  # 1 = confirmed wash, 0 = confirmed clean
+    scored_at: str     # ISO-8601 datetime of the scoring event
+
+
+@app.post("/feedback", dependencies=[Depends(require_admin_key)])
+def submit_feedback(body: FeedbackRequest) -> dict:
+    """Record ground-truth feedback for a previously scored wallet/asset_pair.
+
+    Looks up the stored per-model predictions from the ``risk_scores`` table
+    for the matching ``wallet``, ``asset_pair``, and ``scored_at`` timestamp,
+    then writes one :class:`~detection.feedback_store.ScoringFeedback` row per
+    model (3 rows total).
+
+    Returns ``{"recorded": 3}`` on success or 404 if no matching score is found.
+    """
+    from datetime import datetime, timezone
+
+    from detection.storage import _connect, init_db
+
+    try:
+        scored_at_dt = datetime.fromisoformat(body.scored_at)
+        if scored_at_dt.tzinfo is None:
+            scored_at_dt = scored_at_dt.replace(tzinfo=timezone.utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid scored_at: {exc}")
+
+    # Ensure schema exists before querying
+    init_db()
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT score, shap_json FROM risk_scores "
+            "WHERE wallet = ? AND asset_pair = ? AND timestamp = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (body.wallet, body.asset_pair, scored_at_dt.isoformat()),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No score found for wallet={body.wallet} asset_pair={body.asset_pair} scored_at={body.scored_at}",
+        )
+
+    # We use the blended score / 100 as a proxy probability for each model
+    # when per-model probabilities are not stored separately.
+    blended_prob = row[0] / 100.0
+    confirmed_at = datetime.now(timezone.utc)
+    count = 0
+    for model_name in ("random_forest", "xgboost", "lightgbm"):
+        record_feedback(
+            ScoringFeedback(
+                wallet=body.wallet,
+                asset_pair=body.asset_pair,
+                model_name=model_name,
+                predicted_probability=blended_prob,
+                ground_truth=body.ground_truth,
+                scored_at=scored_at_dt,
+                confirmed_at=confirmed_at,
+            )
+        )
+        count += 1
+
+    return {"recorded": count}
+
+
+# ---------------------------------------------------------------------------
 # Model observability — drift reports and retrain runs (admin-key gated)
 # ---------------------------------------------------------------------------
 
@@ -283,6 +357,17 @@ def circular_path_payments(
 def drift_reports(limit: int = Query(default=50, ge=1, le=1000)) -> list[dict]:
     """Return the most recent drift checks recorded by `cli.py retrain-check`."""
     return get_drift_reports(limit=limit)
+
+
+@app.get("/admin/robustness-report", dependencies=[Depends(require_admin_key)])
+def robustness_report() -> dict:
+    """Return the latest RobustnessReport from the database (admin only)."""
+    from detection.storage import get_latest_robustness_report
+
+    report = get_latest_robustness_report()
+    if report is None:
+        raise HTTPException(status_code=404, detail="No robustness report found")
+    return report
 
 
 @app.get("/admin/retrain-runs", dependencies=[Depends(require_admin_key)])

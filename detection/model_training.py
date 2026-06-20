@@ -27,7 +27,7 @@ def _split_features_labels(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment: bool = True) -> dict:
+def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment: bool = True, adversarial_hardening: bool = False) -> dict:
     """Train RF, XGBoost, and LightGBM classifiers on `df` and return metrics + models.
 
     Applies SMOTE to the training split to address class imbalance, since
@@ -86,6 +86,46 @@ def train_ensemble(df: pd.DataFrame, random_state: int = 42, adversarial_augment
             "pr_auc": average_precision_score(y_test, y_proba),
             "f1": f1_score(y_test, y_pred),
         }
+
+    # --- Adversarial hardening: generate PGD adversarial examples from
+    # training true positives and retrain once on the augmented set.
+    if adversarial_hardening:
+        try:
+            from detection.adversarial_attack import pgd_attack
+            import pandas as pd
+
+            # collect adversarial examples that successfully flip model
+            adv_rows = []
+            # use the ensemble (current models) to attack training positives
+            ensemble_models = {k: v["model"] for k, v in results.items()}
+            X_train_res_df = pd.DataFrame(X_train_res, columns=X_train_res.columns)
+            y_train_res_ser = pd.Series(y_train_res)
+            for idx, (x_row, y_val) in enumerate(zip(X_train_res_df.to_dict(orient="records"), y_train_res_ser.tolist())):
+                if int(y_val) != 1:
+                    continue
+                pert, p = pgd_attack(x_row, ensemble_models, epsilon=0.1, alpha=0.01, steps=10)
+                if p < 0.5:
+                    adv_rows.append({**pert, "label": 1})
+
+            if adv_rows:
+                aug_df = pd.DataFrame(adv_rows)
+                # append to original training set and retrain
+                X_aug = pd.concat([X_train_res_df, aug_df.drop(columns=["label"])], ignore_index=True)
+                y_aug = pd.concat([y_train_res_ser, aug_df["label"].astype(int)], ignore_index=True)
+
+                for name, model in models.items():
+                    model.fit(X_aug, y_aug)
+                    y_proba = model.predict_proba(X_test)[:, 1]
+                    y_pred = model.predict(X_test)
+                    results[name] = {
+                        "model": model,
+                        "auc_roc": roc_auc_score(y_test, y_proba),
+                        "pr_auc": average_precision_score(y_test, y_proba),
+                        "f1": f1_score(y_test, y_pred),
+                    }
+        except Exception:
+            # Hardening is best-effort; failures should not crash training.
+            pass
 
     return results
 

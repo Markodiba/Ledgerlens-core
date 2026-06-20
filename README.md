@@ -40,41 +40,8 @@ At a high level, it does three things:
 - **On-Chain Risk Registry**: Soroban smart contract exposes risk scores so AMMs, lending protocols, and aggregators can gate suspicious activity natively
 - **Public REST API**: Query scores, recent alerts, and asset risk rankings
 - **Lightweight Dashboard**: Web UI for risk-score visibility without requiring technical expertise
-- **Open Methodology**: Scores, features, and training data are fully transparent and auditable
-- **Federated Learning (opt-in)**: Exchange operators can contribute private labelled data to improve the global model without sharing raw transactions — see [Federated Learning](docs/federated_learning.md)
-
-## Federated Learning for Exchange Operators
-
-Exchange operators (wallets, custodians, DEX aggregators built on Stellar) who hold ground-truth compliance labels can opt into federated training to improve LedgerLens's detection quality without surrendering private data.
-
-**How it works:**
-1. Each operator trains a local model on their private labelled dataset.
-2. The local model generates soft-label predictions on a shared *public synthetic* dataset.
-3. Only those predictions (not raw transactions or model weights) are sent to the aggregation server.
-4. The server performs weighted Federated Averaging (FedAvg) with differential privacy noise injection.
-5. All participants receive the improved global soft labels and retrain their local ensembles.
-
-**Privacy guarantees:**
-- No raw transaction data leaves the operator.
-- Each update is (ε, δ)-differentially private (Gaussian mechanism).
-- Cumulative privacy budget is tracked and enforced server-side.
-- Every round produces a cryptographically signed audit record.
-
-**Quick start:**
-
-```bash
-# Server operator: start the aggregation server
-python3 cli.py federated server --host 0.0.0.0 --port 8001
-
-# Exchange operator: join a round with private data
-python3 cli.py federated join \
-  --operator-id my-exchange \
-  --data-path /path/to/labelled_trades.csv \
-  --server-url http://server:8001 \
-  --rounds 5
-```
-
-See [docs/federated_learning.md](docs/federated_learning.md) for the full architecture, operator onboarding guide, and security model.
+ 
+ - Adversarial robustness evaluation: attack, certificate, and hardening tools (see docs/adversarial_robustness.md)
 
 ## Architecture
 

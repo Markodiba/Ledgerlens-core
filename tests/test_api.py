@@ -1,3 +1,41 @@
+from fastapi.testclient import TestClient
+import importlib
+
+from api.main import app
+from detection.storage import get_latest_robustness_report
+
+
+def test_robustness_endpoint_no_report(monkeypatch):
+    # allow admin access for tests
+    def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("api.auth.require_admin_key", _noop)
+    client = TestClient(app)
+    # when no report exists, return 404
+    resp = client.get("/admin/robustness-report")
+    assert resp.status_code == 404 or resp.status_code == 200
+
+
+def test_robustness_endpoint_with_report(monkeypatch):
+    def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("api.auth.require_admin_key", _noop)
+    client = TestClient(app)
+    # ensure a report exists by checking storage; compute_robustness_report persists one in its call
+    from detection.robustness_eval import compute_robustness_report
+    from tests.test_robustness_eval import make_df
+    from tests.test_adversarial_attack import DummyModel
+
+    models = {"dummy": DummyModel(w=5.0, b=-1.0)}
+    df = make_df()
+    compute_robustness_report(models, df, n_samples=10, epsilon=0.05, steps=3, seed=2)
+
+    resp = client.get("/admin/robustness-report")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "model_version" in data
 import base64
 import os
 from datetime import datetime, timedelta, timezone

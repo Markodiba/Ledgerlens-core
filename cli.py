@@ -325,6 +325,40 @@ def eval_robustness(
         typer.echo(f"⚠️  Target missed: adversarial training delta-AUC = {adv_delta:+.3f} (target > -0.10)")
 
 
+
+@app.command("robustness-eval")
+def robustness_eval(
+    epsilon: float = typer.Option(0.1, help="Attack L2 budget"),
+    steps: int = typer.Option(10, help="PGD steps (max 100)"),
+    n_samples: int = typer.Option(200, help="Number of samples from test split to evaluate"),
+) -> None:
+    """Run PGD attacks on the test split and produce a RobustnessReport saved to DB."""
+    if steps > 100:
+        raise typer.BadParameter("--steps cannot exceed 100 for safety")
+
+    from ingestion.synthetic_data import generate_synthetic_dataset
+    from detection.dataset import build_training_dataset
+    from detection.model_inference import load_models
+    from detection.robustness_eval import compute_robustness_report
+    from config.settings import settings
+
+    trades, account_metadata, events, labels = generate_synthetic_dataset(n_normal_accounts=50, n_wash_rings=10, ring_size=4, seed=42)
+    df = build_training_dataset(trades, labels, account_metadata=account_metadata, order_book_events=events)
+
+    try:
+        models = load_models(settings.model_dir)
+    except FileNotFoundError:
+        # train a temporary ensemble for evaluation
+        from detection.model_training import train_ensemble
+
+        logger.info("No trained models found; training temporary ensemble for robustness evaluation")
+        results = train_ensemble(df, adversarial_augment=False)
+        models = {k: v["model"] for k, v in results.items()}
+
+    report = compute_robustness_report(models, df.sample(n=min(n_samples, len(df)), random_state=42), n_samples=200, epsilon=epsilon, steps=steps)
+    typer.echo(report.json(indent=2))
+
+
 @app.command("serve")
 def serve(
     host: str = typer.Option("127.0.0.1", help="Host to bind to"),
@@ -366,6 +400,48 @@ def db_migrate(
         typer.echo(f"Migrated from version {before} → {after}. Applied: {applied}")
     else:
         typer.echo(f"Database already at latest schema version {after}. No migrations applied.")
+
+
+@app.command("reweight")
+def reweight(
+    days_back: int = typer.Option(7, "--days-back", help="Feedback window in days"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print proposed weights without writing"),
+) -> None:
+    """Update ensemble weights from recent feedback using Bayesian Model Averaging.
+
+    Loads the last *days_back* days of scoring feedback, computes updated
+    weights via :func:`detection.ensemble_reweighter.compute_updated_weights`,
+    and (unless ``--dry-run``) writes them to ``models/ensemble_weights.json``.
+    """
+    from config.settings import settings
+    from detection.ensemble_reweighter import apply_weights, compute_updated_weights
+    from detection.feedback_store import get_recent_feedback
+
+    feedback = get_recent_feedback(days_back=days_back)
+    logger.info("Loaded %d feedback records from the last %d days", len(feedback), days_back)
+
+    current = {
+        "random_forest": settings.ensemble_weight_rf,
+        "xgboost": settings.ensemble_weight_xgb,
+        "lightgbm": settings.ensemble_weight_lgbm,
+    }
+    proposed = compute_updated_weights(feedback)
+
+    header = f"{'Model':<20} {'Current':>10} {'Proposed':>10}"
+    divider = "─" * len(header)
+    typer.echo(divider)
+    typer.echo(header)
+    typer.echo(divider)
+    for model in ("random_forest", "xgboost", "lightgbm"):
+        typer.echo(f"{model:<20} {current[model]:>10.4f} {proposed[model]:>10.4f}")
+    typer.echo(divider)
+
+    if dry_run:
+        typer.echo("Dry run — ensemble_weights.json not written.")
+        return
+
+    apply_weights(proposed, settings.model_dir)
+    typer.echo("Wrote updated weights to ensemble_weights.json")
 
 
 @app.command("webhook-worker")
