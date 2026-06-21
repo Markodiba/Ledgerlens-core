@@ -12,7 +12,7 @@ account-metadata inputs are optional and come from
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import compute_benford_metrics
+from detection.benford_engine import compute_benford_metrics, multivariate_benford_score
 from detection.path_payment_engine import detect_atomic_circular_routes
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
 
@@ -77,6 +77,12 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
+MULTIVARIATE_BENFORD_FEATURE_NAMES = [
+    "benford_copula_pval",  # p-value of the cross-pair copula dependence test
+    "cross_pair_sync_ratio",  # fraction of windows with >= 3 simultaneous digit anomalies
+    "digit_entropy_delta",  # observed minus expected joint leading-digit entropy
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -85,6 +91,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + MULTIVARIATE_BENFORD_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -481,6 +488,52 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
+def multivariate_benford_features(
+    account: str,
+    trades_by_pair: dict[str, pd.DataFrame] | None,
+) -> dict:
+    """Compute the cross-pair (multivariate) Benford features for `account`.
+
+    Builds the joint digit distribution over the pairs `account` is active in
+    and runs the copula dependence test, the synchrony score, and the joint
+    digit-entropy delta (see `detection.benford_engine.multivariate_benford_score`).
+    A coordinated syndicate that keeps each pair individually Benford-clean shows
+    up here as a low `benford_copula_pval`. Requires `trades_by_pair` and at
+    least two active pairs; otherwise the neutral defaults (pval 1.0, others 0.0)
+    are returned so existing single-pair callers are unaffected.
+    """
+    default = {
+        "benford_copula_pval": 1.0,
+        "cross_pair_sync_ratio": 0.0,
+        "digit_entropy_delta": 0.0,
+    }
+    if not trades_by_pair:
+        return default
+
+    frames = []
+    active_pairs = []
+    for pair, df in trades_by_pair.items():
+        if df is None or df.empty:
+            continue
+        base = df["base_account"] if "base_account" in df.columns else pd.Series(index=df.index, dtype=object)
+        counter = df["counter_account"] if "counter_account" in df.columns else pd.Series(index=df.index, dtype=object)
+        if not (base == account).any() and not (counter == account).any():
+            continue
+        active_pairs.append(pair)
+        frames.append(df.assign(asset_pair=pair))
+
+    if len(active_pairs) < 2:
+        return default
+
+    combined = pd.concat(frames, ignore_index=True)
+    result = multivariate_benford_score(combined, [(account, p) for p in active_pairs])
+    return {
+        "benford_copula_pval": float(result["copula_pval"]),
+        "cross_pair_sync_ratio": float(result["sync_ratio"]),
+        "digit_entropy_delta": float(result["digit_entropy_delta"]),
+    }
+
+
 def build_feature_vector(
     trades: pd.DataFrame,
     account: str,
@@ -537,6 +590,7 @@ def build_feature_vector(
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
+    features.update(multivariate_benford_features(account, trades_by_pair))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features

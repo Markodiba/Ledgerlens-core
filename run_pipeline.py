@@ -163,6 +163,8 @@ def run(
                 benford_mad_threshold=settings.benford_mad_threshold,
                 ml_probability=probability,
                 ml_confidence=confidence,
+                benford_copula_pval=features.get("benford_copula_pval", 1.0),
+                benford_copula_weight=settings.benford_copula_weight,
             )
             scores.append(score)
             scored_features.append(features)
@@ -338,6 +340,8 @@ async def async_run(
                     benford_mad_threshold=settings.benford_mad_threshold,
                     ml_probability=probability,
                     ml_confidence=confidence,
+                    benford_copula_pval=features.get("benford_copula_pval", 1.0),
+                    benford_copula_weight=settings.benford_copula_weight,
                 )
                 scores.append(score)
                 scored_features.append(features)
@@ -458,6 +462,8 @@ def _flush_streaming_buffer(
             benford_mad_threshold=settings.benford_mad_threshold,
             ml_probability=probability,
             ml_confidence=confidence,
+            benford_copula_pval=features.get("benford_copula_pval", 1.0),
+            benford_copula_weight=settings.benford_copula_weight,
         )
         scores.append(score)
         scored_features.append(features)

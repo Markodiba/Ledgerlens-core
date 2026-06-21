@@ -30,19 +30,33 @@ class RiskScore(BaseModel):
         benford_mad_threshold: float,
         ml_probability: float,
         ml_confidence: float,
+        benford_copula_pval: float = 1.0,
+        benford_copula_weight: float = 0.0,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
         `score` is a 0-100 blend weighted toward the ML probability, with
         the Benford signal acting as a corroborating flag.
+
+        `benford_copula_pval` is the cross-pair multivariate Benford dependence
+        p-value from `detection.benford_engine.benford_copula_statistic`. A small
+        p-value is evidence of coordinated multi-pair manipulation, so it adds a
+        `benford_copula_weight` fraction of the composite score; the Benford/ML
+        blend supplies the remaining `1 - benford_copula_weight`. With the default
+        `benford_copula_weight = 0.0` the score is the legacy Benford/ML blend, so
+        existing callers and tests are unaffected.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
 
         benford_component = min(benford_mad / benford_mad_threshold, 1.0) * 100 if benford_mad_threshold else 0.0
         ml_component = ml_probability * 100
+        base_component = 0.3 * benford_component + 0.7 * ml_component
 
-        score = round(0.3 * benford_component + 0.7 * ml_component)
+        copula_weight = max(0.0, min(1.0, benford_copula_weight))
+        copula_component = max(0.0, min(1.0, 1.0 - benford_copula_pval)) * 100
+
+        score = round((1.0 - copula_weight) * base_component + copula_weight * copula_component)
         score = max(0, min(100, score))
 
         return cls(
