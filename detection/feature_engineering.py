@@ -11,14 +11,19 @@ account-metadata inputs are optional and come from
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import compute_benford_metrics
+from detection.benford_engine import compute_benford_metrics, multivariate_benford_score
 from detection.causal_engine import estimate_pdc
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
+
+if TYPE_CHECKING:
+    from detection.cross_chain_linker import CrossChainLinker
 
 ROLLING_WINDOWS = {
     "1h": pd.Timedelta(hours=1),
@@ -95,6 +100,17 @@ CROSS_CHAIN_FEATURE_NAMES = [
     "cross_chain_time_lag_median_h",
 ]
 
+MULTIVARIATE_BENFORD_FEATURE_NAMES = [
+    "benford_copula_pval",
+    "cross_pair_sync_ratio",
+    "digit_entropy_delta",
+]
+
+CAUSAL_FEATURE_NAMES = [
+    "pdc_5m",
+    "pdc_1h",
+]
+
 FEATURE_NAMES = (
     BENFORD_FEATURE_NAMES
     + TRADE_PATTERN_FEATURE_NAMES
@@ -119,6 +135,10 @@ except ImportError:  # pragma: no cover
 # Cross-chain features are appended last so existing model checkpoints remain
 # loadable — old models see 0.0 for these features during inference.
 FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assignment]
+
+# Multivariate-Benford and causal (PDC) features are appended after
+# cross-chain features for the same checkpoint-compatibility reason.
+FEATURE_NAMES = FEATURE_NAMES + MULTIVARIATE_BENFORD_FEATURE_NAMES + CAUSAL_FEATURE_NAMES  # type: ignore[assignment]
 
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
@@ -594,6 +614,44 @@ def build_cross_chain_features(
     }
 
 
+def multivariate_benford_features(account: str, trades_by_pair: dict[str, pd.DataFrame] | None) -> dict:
+    """Cross-pair Benford coordination features for `account`.
+
+    `trades_by_pair` maps asset-pair label -> trades DataFrame (each row must
+    carry an `asset_pair` column; see
+    `detection.benford_engine.multivariate_benford_score`). Omitting it (or
+    passing fewer than 2 pairs) yields the i.i.d.-Benford defaults.
+    """
+    zero = {name: (1.0 if name == "benford_copula_pval" else 0.0) for name in MULTIVARIATE_BENFORD_FEATURE_NAMES}
+    if not trades_by_pair or len(trades_by_pair) < 2:
+        return zero
+
+    wallet_pairs = [(account, pair) for pair in trades_by_pair]
+    combined = pd.concat(trades_by_pair.values(), ignore_index=True)
+    result = multivariate_benford_score(combined, wallet_pairs)
+    return {
+        "benford_copula_pval": result["copula_pval"],
+        "cross_pair_sync_ratio": result["sync_ratio"],
+        "digit_entropy_delta": result["digit_entropy_delta"],
+    }
+
+
+def causal_features(
+    trades: pd.DataFrame, account: str, prices: pd.DataFrame | None, pair: str | None
+) -> dict:
+    """Price-discovery-contribution (PDC) features for `account` on `pair`.
+
+    `prices` is a `timestamp` + `mid_price`/`price` series for `pair`;
+    omitting it (or `pair`) yields `0.0` for both windows.
+    """
+    if prices is None or pair is None:
+        return {name: 0.0 for name in CAUSAL_FEATURE_NAMES}
+    return {
+        "pdc_5m": estimate_pdc(trades, prices, account, pair, window_minutes=5),
+        "pdc_1h": estimate_pdc(trades, prices, account, pair, window_minutes=60),
+    }
+
+
 def _build_feature_vector_base(
     trades: pd.DataFrame,
     account: str,
@@ -666,6 +724,9 @@ def _build_feature_vector_base(
         features.update(build_cross_chain_features(account, cross_chain_linker, sdex_volume=sdex_volume))
     else:
         features.update({name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES})
+
+    features.update(multivariate_benford_features(account, trades_by_pair))
+    features.update(causal_features(trades, account, prices, pair))
 
     return features
 

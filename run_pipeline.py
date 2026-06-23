@@ -24,7 +24,7 @@ from detection.cross_pair_engine import (
 )
 from detection.drift_monitor import record_scored_features
 from detection.feature_engineering import build_feature_vector
-from detection.feature_store import FeatureStore, WalletFeatureState, update_feature_state, derive_feature_vector
+from detection.feature_store import FeatureStore
 from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_models, score_feature_matrix, score_feature_vector
 from detection.path_payment_engine import detect_atomic_circular_routes
@@ -37,7 +37,6 @@ from detection.storage import (
     save_path_payments,
     save_rings,
     save_scores,
-    save_feature_state,
     promote_cold_to_hot,
 )
 from detection.shap_explainer import explain_score, top_contributing_features
@@ -179,7 +178,7 @@ def run(
         graph = build_transaction_graph(trades)
         rings = find_wash_rings(graph)
         all_rings.extend(rings)
-        _ring_membership = build_ring_membership_index(rings, trades=trades)
+        ring_membership = build_ring_membership_index(rings, trades=trades)
         accounts = pd.unique(trades[["base_account", "counter_account"]].values.ravel())
         accounts = accounts[pd.notna(accounts)]  # drop None (pool trades have no counterparty wallet)
         account_metadata = load_account_metadata(list(accounts))

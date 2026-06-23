@@ -18,12 +18,22 @@ from typing import Tuple
 
 import numpy as np
 
+from detection.counterfactual_constraints import FEATURE_CONSTRAINTS as _FEATURE_CONSTRAINTS_LIST
 from detection.feature_engineering import FEATURE_NAMES
-try:
-    from detection.counterfactual_constraints import FEATURE_CONSTRAINTS
-except Exception:
-    # Fallback: minimal constraints if upstream module missing
-    from detection.counterfactual_constraints import FEATURE_CONSTRAINTS  # type: ignore
+
+# `detection.counterfactual_constraints.FEATURE_CONSTRAINTS` is a
+# `list[FeatureConstraint]`; this module predates that dataclass and expects
+# a `{feature_name: {"mutable", "direction", "min", "max"}}` dict, so adapt it
+# here rather than rewriting every call site below.
+FEATURE_CONSTRAINTS = {
+    c.feature_name: {
+        "mutable": c.mutable,
+        "direction": None if c.direction == "any" else c.direction,
+        "min": c.min_val if c.min_val is not None else -math.inf,
+        "max": c.max_val if c.max_val is not None else math.inf,
+    }
+    for c in _FEATURE_CONSTRAINTS_LIST
+}
 
 
 def _validate_feature_vector(vec: dict) -> None:

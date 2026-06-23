@@ -217,3 +217,25 @@ def _pre_attack_price(prices: list[float], buy_idx: int, fallback: float) -> flo
         if prev > 0:
             return prev
     return fallback
+
+
+def sandwich_candidates_to_alerts(candidates: list[SandwichCandidate], asset_pair: str) -> list[dict]:
+    """Convert detected sandwich candidates into alert dicts for `detection.storage.save_alerts`."""
+    return [
+        {
+            "alert_type": "SANDWICH_ATTACK",
+            "wallet": c.attacker,
+            "asset_pair": asset_pair,
+            "pool_id": c.pool_id,
+            "detail": {
+                "victim": c.victim,
+                "profit_xlm": c.profit_xlm,
+                "slippage_inflicted": c.slippage_inflicted,
+                "ledger_sequence": c.ledger_sequence,
+                "buy_op_idx": c.buy_op_idx,
+                "victim_op_idx": c.victim_op_idx,
+                "sell_op_idx": c.sell_op_idx,
+            },
+        }
+        for c in candidates
+    ]

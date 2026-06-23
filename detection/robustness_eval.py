@@ -14,10 +14,9 @@ from sklearn.metrics import f1_score, roc_auc_score
 from detection.dataset import build_training_dataset
 from ingestion.adversarial_data import ALL_STRATEGIES, generate_adversarial_dataset
 from ingestion.synthetic_data import generate_synthetic_dataset
-from detection.adversarial_attack import pgd_attack
+from detection.adversarial_attack import FEATURE_CONSTRAINTS, pgd_attack
 
 from detection.feature_engineering import FEATURE_NAMES
-from detection.counterfactual_constraints import FEATURE_CONSTRAINTS
 
 
 class RobustnessReport(BaseModel):

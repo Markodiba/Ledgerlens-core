@@ -20,6 +20,8 @@ import os
 import re
 import sqlite3
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -32,12 +34,15 @@ from config.settings import settings
 from detection.amm_engine import pool_risk_from_trade_rows
 from detection.feedback_store import ScoringFeedback, record_feedback
 from detection.risk_score import RiskScore
+from detection.counterfactual_engine import generate_counterfactuals
+from detection.counterfactual_translator import translate_counterfactual
 from detection.storage import (
     get_alerts,
     get_bridge_transfer_history,
     get_bridge_transfers,
     get_circular_routes,
     get_drift_reports,
+    get_feature_vector_for_wallet,
     get_latest_scores,
     get_liquidity_pool_trades,
     get_pair_correlations,
@@ -46,7 +51,6 @@ from detection.storage import (
     get_shap_values,
 )
 from detection.dispute_store import submit_dispute, get_dispute, cast_vote
-import sqlite3
 from detection.governance import create_proposal, list_open_proposals, cast_proposal_vote
 from detection.webhook_queue import get_dead_letters
 from detection.webhook_registry import deactivate_subscriber, list_subscribers, register_subscriber
@@ -243,6 +247,75 @@ def explain_wallet_score(
             detail=f"No SHAP cache found for wallet {wallet} on {asset_pair}",
         )
     return cached
+
+
+_COUNTERFACTUAL_TIMEOUT_SECONDS = 5
+_counterfactual_executor = ThreadPoolExecutor(max_workers=4)
+
+
+@app.get("/scores/{wallet}/counterfactual")
+def wallet_counterfactual(
+    wallet: str,
+    asset_pair: str = Query(..., description="Asset pair to generate counterfactuals for, e.g. XLM/USDC"),
+    n: int = Query(default=3, ge=1, le=5),
+    target_score: int | None = Query(default=None, ge=0, le=99),
+) -> dict:
+    """Return up to `n` minimal feature changes that would drop `wallet`'s score below `target_score`.
+
+    Looks up `wallet`'s most recently cached feature vector for `asset_pair`
+    (saved by `run_pipeline.py`), then searches for feasible counterfactuals
+    with `detection.counterfactual_engine.generate_counterfactuals` and
+    translates each into plain English. Only feature deltas and human-readable
+    text are returned -- never model weights or internal probability outputs.
+
+    The search is hard-capped at 5 seconds; if it doesn't finish in time this
+    still returns 200 with an empty `counterfactuals` list rather than hanging
+    indefinitely (unbounded optimisation search is a denial-of-service vector).
+
+    - **404** — no cached feature vector for the given wallet / asset pair.
+    - **422** — `target_score` outside `[0, 99]` or `n` outside `[1, 5]`.
+    - **503** — models were not loaded at startup.
+    """
+    if not _models:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
+    validate_stellar_address(wallet)
+    feature_vector = get_feature_vector_for_wallet(wallet, asset_pair)
+    if feature_vector is None:
+        raise HTTPException(
+            status_code=404, detail=f"No cached feature vector for wallet {wallet} on {asset_pair}"
+        )
+
+    from detection.model_inference import score_feature_vector
+
+    resolved_target_score = target_score if target_score is not None else settings.risk_score_threshold - 1
+    current_probability, _confidence = score_feature_vector(_models, feature_vector)
+    current_score = round(current_probability * 100)
+
+    future = _counterfactual_executor.submit(
+        generate_counterfactuals, feature_vector, _models, n, resolved_target_score
+    )
+    try:
+        counterfactuals = future.result(timeout=_COUNTERFACTUAL_TIMEOUT_SECONDS)
+    except FutureTimeoutError:
+        counterfactuals = []
+
+    return {
+        "wallet": wallet,
+        "asset_pair": asset_pair,
+        "current_score": current_score,
+        "target_score": resolved_target_score,
+        "counterfactuals": [
+            {
+                "rank": rank,
+                "distance": cf["distance"],
+                "predicted_score": cf["predicted_score"],
+                "feature_deltas": cf["feature_deltas"],
+                "human_readable": translate_counterfactual(cf["feature_deltas"]),
+            }
+            for rank, cf in enumerate(counterfactuals, start=1)
+        ],
+    }
 
 
 @app.get("/scores/{wallet}")

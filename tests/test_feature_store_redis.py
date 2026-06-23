@@ -1,5 +1,7 @@
 """Tests for FeatureStore Redis integration and fallback behavior."""
 
+import importlib.util
+
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
@@ -64,8 +66,6 @@ def test_feature_store_redis_ttl(sample_state):
         
         # Check TTL was set (fakeredis stores TTL internally)
         key = fs._hash_key(sample_state.wallet, sample_state.asset_pair)
-        ttl = mock_client.ttl(key)
-        # fakeredis returns -1 if no TTL or -2 if key doesn't exist
         # This test verifies the key was stored
         assert mock_client.exists(key) > 0
 
@@ -100,9 +100,7 @@ def test_feature_store_redis_scan_all_keys(sample_state):
 
 def test_feature_store_redis_fallback_on_connection_error():
     """Test fallback to in-process dict when Redis is unavailable."""
-    try:
-        import fakeredis
-    except ImportError:
+    if importlib.util.find_spec("fakeredis") is None:
         pytest.skip("fakeredis not installed")
     
     with patch("detection.feature_store.redis.from_url") as mock_redis:
@@ -118,9 +116,7 @@ def test_feature_store_redis_fallback_on_connection_error():
 
 def test_feature_store_redis_fallback_on_ping_error():
     """Test fallback when redis.ping() fails."""
-    try:
-        import fakeredis
-    except ImportError:
+    if importlib.util.find_spec("fakeredis") is None:
         pytest.skip("fakeredis not installed")
     
     with patch("detection.feature_store.redis.from_url") as mock_redis:
@@ -191,9 +187,7 @@ def test_feature_store_delete_state_fallback(sample_state):
 
 def test_feature_store_fallback_to_dict_on_redis_error(sample_state):
     """Test that operations fall back to dict when Redis operations fail."""
-    try:
-        import fakeredis
-    except ImportError:
+    if importlib.util.find_spec("fakeredis") is None:
         pytest.skip("fakeredis not installed")
     
     with patch("detection.feature_store.redis.from_url") as mock_redis:

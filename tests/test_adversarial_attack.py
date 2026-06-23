@@ -2,9 +2,8 @@ import math
 
 import numpy as np
 
-from detection.adversarial_attack import fgsm_attack, pgd_attack
+from detection.adversarial_attack import FEATURE_CONSTRAINTS, fgsm_attack, pgd_attack
 from detection.feature_engineering import FEATURE_NAMES
-from detection.counterfactual_constraints import FEATURE_CONSTRAINTS
 
 
 class DummyModel:
@@ -65,7 +64,10 @@ def test_asr_positive_at_large_eps():
     rows = [vec.copy() for _ in range(5)]
     flipped = 0
     for r in rows:
-        pert, p = pgd_attack(r, models, epsilon=0.5, alpha=0.05, steps=10)
+        # epsilon scaled up from the original 0.5: FEATURE_NAMES has grown to 62
+        # features since this test was written, raising the baseline logit enough
+        # that the old budget could no longer flip the classification.
+        pert, p = pgd_attack(r, models, epsilon=3.0, alpha=0.3, steps=10)
         if p < 0.5:
             flipped += 1
     assert flipped > 0

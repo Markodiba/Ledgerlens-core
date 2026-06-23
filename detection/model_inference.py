@@ -12,6 +12,7 @@ import numpy as np
 
 import config.settings as settings_module
 from detection.feature_engineering import FEATURE_NAMES
+from detection.gnn_model import _HAS_PYG, safe_load_gnn_checkpoint
 from detection.model_signing import assert_within_model_dir, safe_joblib_load
 
 logger = logging.getLogger("ledgerlens.model_inference")
@@ -21,11 +22,18 @@ _REQUIRED_KEYS = frozenset({"random_forest", "xgboost", "lightgbm"})
 _weights_mtime: float | None = None
 _runtime_weights: dict[str, float] | None = None
 
+# Names in this set are skipped by the ensemble's predict_proba loop below:
+# they are feature generators or sequence models, not part of the weighted
+# tabular-classifier vote (their signal already flows into the feature
+# vector itself -- see `feature_engineering.build_feature_vector`).
+_NON_VOTING_MODELS = frozenset({"temporal_lstm", "gnn"})
+
 _MODEL_FILENAMES = {
     "random_forest": "random_forest.joblib",
     "xgboost": "xgboost.joblib",
     "lightgbm": "lightgbm.joblib",
     "temporal_lstm": "temporal_lstm.joblib",
+    "gnn": "gnn_model.pt",
 }
 
 
@@ -103,15 +111,32 @@ def load_runtime_weights(model_dir: str) -> dict[str, float] | None:
 
 
 def load_models(model_dir: str | None = None) -> dict:
-    """Load all trained models from `model_dir` (defaults to `settings.model_dir`)."""
+    """Load all trained models from `model_dir` (defaults to `settings.model_dir`).
+
+    `gnn_model.pt`, if present and `torch`/`torch_geometric` are installed, is
+    loaded separately via `safe_load_gnn_checkpoint` -- it is a PyTorch
+    checkpoint, not a joblib-pickled sklearn-style model like the rest of
+    `_MODEL_FILENAMES`.
+    """
     model_dir = model_dir or settings_module.settings.model_dir
     signing_key = settings_module.settings.model_signing_key.encode()
     models = {}
     for name, filename in _MODEL_FILENAMES.items():
+        if name == "gnn":
+            continue
         path = os.path.join(model_dir, filename)
         if os.path.exists(path):
             assert_within_model_dir(path, model_dir)
             models[name] = safe_joblib_load(path, signing_key)
+
+    gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
+    if os.path.exists(gnn_path) and _HAS_PYG:
+        try:
+            models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
+        except RuntimeError as exc:
+            logger.error("GNN checkpoint failed validation: %s", exc)
+            raise
+
     if not models:
         raise FileNotFoundError(f"No trained models found in {model_dir}. Run model_training first.")
     return models
@@ -151,7 +176,7 @@ def score_feature_vector(models: dict, feature_vector: dict) -> tuple[float, flo
 
     probabilities = {}
     for name, model in models.items():
-        if name == "temporal_lstm":
+        if name in _NON_VOTING_MODELS:
             continue
         if hasattr(model, "feature_names_in_"):
             ordered = X[:, [FEATURE_NAMES.index(f) for f in model.feature_names_in_]]
@@ -191,7 +216,7 @@ def score_feature_matrix(
 
     model_probs: dict[str, np.ndarray] = {}
     for name, model in models.items():
-        if name == "temporal_lstm":
+        if name in _NON_VOTING_MODELS:
             continue
         if hasattr(model, "feature_names_in_"):
             col_idx = [FEATURE_NAMES.index(f) for f in model.feature_names_in_]
@@ -210,66 +235,3 @@ def score_feature_matrix(
     confidences = np.clip(1.0 - np.std(all_probs, axis=0), 0.0, 1.0)  # (N,)
 
     return [(float(weighted_probs[i]), float(confidences[i])) for i in range(len(feature_vectors))]
-
-
-from detection.gnn_model import safe_load_gnn_checkpoint, _HAS_PYG
-from ingestion.graph_builder import TemporalGraphBuilder
-import os
-
-_MODEL_FILENAMES = dict(globals().get("_MODEL_FILENAMES", {}))
-_MODEL_FILENAMES["gnn"] = "gnn_model.pt"
-
-
-def load_models(model_dir: str, *args, **kwargs) -> dict:
-    """Wraps the base model loader, also loading gnn_model.pt if present."""
-    models = _load_models_base(model_dir, *args, **kwargs)
-
-    gnn_path = os.path.join(model_dir, _MODEL_FILENAMES["gnn"])
-    if os.path.exists(gnn_path) and _HAS_PYG:
-        try:
-            models["gnn"] = safe_load_gnn_checkpoint(gnn_path)
-        except RuntimeError as e:
-            logger.error("GNN checkpoint failed validation: %s", e)
-            raise
-    return models
-
-
-def score_feature_matrix(batch, models: dict, *args, **kwargs):
-    """Wraps the base scorer, computing GNN features per-batch first.
-
-    Benchmark target: T-GNN forward pass adds <= 200ms / 500-wallet batch
-    on a single CPU core.
-    """
-    gnn_features = {}
-    if "gnn" in models and _HAS_PYG:
-        builder = TemporalGraphBuilder()
-        trades = _trades_from_batch(batch)
-        snapshots = builder.build_snapshots(trades, lookback_days=1)
-        gnn_features = _gnn_forward_pass(models["gnn"], snapshots)
-
-    return _score_feature_matrix_base(
-        batch, models, *args, use_gnn=bool(gnn_features), gnn_features=gnn_features, **kwargs
-    )
-
-
-def _gnn_forward_pass(model, snapshots) -> dict:
-    """Runs the T-GNN over snapshots, returns per-wallet GNN feature dict."""
-    import torch
-    results = {}
-    model.eval()
-    with torch.no_grad():
-        for snap in snapshots:
-            if snap.edge_index.shape[1] == 0:
-                continue
-            x = torch.tensor(snap.node_features, dtype=torch.float32)
-            edge_index = torch.tensor(snap.edge_index, dtype=torch.long)
-            edge_attr = torch.tensor(snap.edge_attr, dtype=torch.float32)
-            edge_time = torch.zeros(edge_index.shape[1])
-            scores = model(x, edge_index, edge_attr, edge_time)
-            neighbor_avg = model.neighbor_avg_score(scores, edge_index, x.shape[0])
-            for addr, idx in snap.wallet_index.items():
-                results[addr] = {
-                    "gnn_wash_ring_probability": float(scores[idx].item()),
-                    "gnn_neighbor_avg_score": float(neighbor_avg[idx].item()),
-                }
-    return results

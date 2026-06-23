@@ -32,6 +32,10 @@ class RiskScore(BaseModel):
         ml_confidence: float,
         sandwich_signal: float = 0.0,
         sandwich_weight: float = 0.0,
+        benford_copula_pval: float = 1.0,
+        benford_copula_weight: float = 0.0,
+        pdc_score: float = 0.0,
+        pdc_discount_weight: float = 0.0,
     ) -> "RiskScore":
         """Combine Benford metrics and an ML probability into a single score.
 
@@ -44,6 +48,17 @@ class RiskScore(BaseModel):
         score; the Benford/ML blend supplies the remaining `1 - sandwich_weight`.
         With the default `sandwich_weight = 0.0` the score is identical to the
         legacy Benford/ML blend.
+
+        `benford_copula_pval` is the cross-pair Benford copula p-value from
+        `detection.benford_engine.multivariate_benford_score` (1.0 = no
+        coordination evidence). A low p-value boosts the score by up to
+        `benford_copula_weight` * 100 points; the default weight of 0.0
+        leaves the score unaffected.
+
+        `pdc_score` is the causal price-discovery-contribution estimate from
+        `detection.causal_engine.estimate_pdc`. Only a *positive* PDC (market-
+        making behaviour) discounts the score, by `pdc_score * pdc_discount_weight`
+        points; a negative PDC (wash-trading signal) never raises it.
         """
         benford_flag = benford_mad > benford_mad_threshold
         ml_flag = ml_probability >= 0.5
@@ -55,8 +70,14 @@ class RiskScore(BaseModel):
         sandwich_weight = max(0.0, min(1.0, sandwich_weight))
         sandwich_component = max(0.0, min(1.0, sandwich_signal)) * 100
 
-        score = round((1.0 - sandwich_weight) * base_component + sandwich_weight * sandwich_component)
-        score = max(0, min(100, score))
+        score = (1.0 - sandwich_weight) * base_component + sandwich_weight * sandwich_component
+
+        copula_pval = max(0.0, min(1.0, benford_copula_pval))
+        score += (1.0 - copula_pval) * 100 * benford_copula_weight
+
+        score -= max(0.0, pdc_score) * pdc_discount_weight
+
+        score = max(0, min(100, round(score)))
 
         return cls(
             wallet=wallet,

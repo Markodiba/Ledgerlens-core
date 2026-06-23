@@ -46,6 +46,13 @@ class Settings:
         default_factory=lambda: float(os.getenv("BENFORD_COPULA_WEIGHT", "0.0"))
     )
 
+    # Points subtracted per unit of positive price-discovery-contribution (PDC)
+    # (see detection.risk_score.RiskScore.combine). 0.0 preserves the legacy
+    # Benford/ML-only blend; negative PDC never increases the score.
+    pdc_discount_weight: float = field(
+        default_factory=lambda: float(os.getenv("PDC_DISCOUNT_WEIGHT", "0.0"))
+    )
+
     model_dir: str = field(default_factory=lambda: os.getenv("MODEL_DIR", "./models"))
     db_path: str = field(default_factory=lambda: os.getenv("LEDGERLENS_DB_PATH", "./ledgerlens.db"))
 

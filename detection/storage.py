@@ -15,6 +15,7 @@ integration point is wired up (see README's "Open Integration Points"),
 """
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -24,7 +25,10 @@ import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
+from detection.sandwich_engine import sandwich_candidates_to_alerts  # noqa: F401
 from ingestion.data_models import BridgeTransfer, PathPayment
+
+logger = logging.getLogger("ledgerlens.storage")
 
 
 class AlertType(str, Enum):
@@ -328,6 +332,36 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
             ON bridge_transfers (evm_wallet);
         CREATE INDEX IF NOT EXISTS idx_bridge_transfers_timestamp
             ON bridge_transfers (timestamp);
+        """,
+    ),
+    (
+        11,
+        "add alerts table for typed manipulation alerts",
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_type TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            pool_id TEXT,
+            detail_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_alert_type ON alerts (alert_type);
+        CREATE INDEX IF NOT EXISTS idx_alerts_wallet ON alerts (wallet);
+        """,
+    ),
+    (
+        12,
+        "add wallet_feature_vectors table",
+        """
+        CREATE TABLE IF NOT EXISTS wallet_feature_vectors (
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            feature_vector_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (wallet, asset_pair)
+        );
         """,
     ),
 ]
@@ -1391,6 +1425,111 @@ def get_bridge_transfer_history(
         }
         for row in rows
     ]
+
+
+def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
+    """Persist typed manipulation alerts (see `AlertType`).
+
+    Each alert dict must have `alert_type`, `wallet`, `asset_pair`, and
+    `detail` (a JSON-serialisable dict); `pool_id` is optional.
+    """
+    if not alerts:
+        return
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO alerts (alert_type, wallet, asset_pair, pool_id, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    a["alert_type"],
+                    a["wallet"],
+                    a["asset_pair"],
+                    a.get("pool_id"),
+                    json.dumps(a.get("detail", {})),
+                    now,
+                )
+                for a in alerts
+            ],
+        )
+        conn.commit()
+
+
+def get_alerts(
+    alert_type: str,
+    limit: int = 100,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return stored alerts of `alert_type`, most recent first."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT alert_type, wallet, asset_pair, pool_id, detail_json, created_at
+            FROM alerts
+            WHERE alert_type = ?
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (alert_type, limit, offset),
+        ).fetchall()
+
+    return [
+        {
+            "alert_type": row[0],
+            "wallet": row[1],
+            "asset_pair": row[2],
+            "pool_id": row[3],
+            "detail": json.loads(row[4]),
+            "created_at": row[5],
+        }
+        for row in rows
+    ]
+
+
+def save_feature_vector_for_wallet(
+    wallet: str,
+    asset_pair: str,
+    feature_vector: dict,
+    db_path: str | None = None,
+) -> None:
+    """Upsert the most recent feature vector for `(wallet, asset_pair)`.
+
+    Used by `run_pipeline.py` after scoring so `/scores/{wallet}/counterfactual`
+    can look up the feature vector that produced a wallet's latest score.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO wallet_feature_vectors (wallet, asset_pair, feature_vector_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(wallet, asset_pair) DO UPDATE SET
+                feature_vector_json = excluded.feature_vector_json,
+                updated_at = excluded.updated_at
+            """,
+            (wallet, asset_pair, json.dumps(feature_vector), datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+
+def get_feature_vector_for_wallet(
+    wallet: str,
+    asset_pair: str,
+    db_path: str | None = None,
+) -> dict | None:
+    """Return the most recently saved feature vector for `(wallet, asset_pair)`, or `None`."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT feature_vector_json FROM wallet_feature_vectors WHERE wallet = ? AND asset_pair = ?",
+            (wallet, asset_pair),
+        ).fetchone()
+    return json.loads(row[0]) if row else None
 
 
 if __name__ == "__main__":
