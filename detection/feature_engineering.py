@@ -86,6 +86,13 @@ PATH_PAYMENT_FEATURE_NAMES = [
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
 ]
 
+PATH_PAYMENT_CYCLE_FEATURE_NAMES = [
+    "path_cycle_count_24h",  # closed multi-hop cycles this account is part of in 24h
+    "path_cycle_xlm_volume_24h",  # total XLM value of cyclic path-payment volume in 24h
+    "max_cycle_length",  # longest detected cycle (longer == more sophisticated evasion)
+    "cycle_asset_diversity",  # distinct intermediate assets across this account's cycles
+]
+
 SANDWICH_FEATURE_NAMES = [
     "sandwich_ratio",  # fraction of an account's pool trades that are attacker legs of a sandwich
     "sandwich_profit_xlm_30d",  # XLM the account extracted as a sandwich attacker over the last 30d
@@ -526,6 +533,29 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     }
 
 
+def path_payment_cycle_features(
+    path_payments: list[PathPayment] | None,
+    path_cycles: list[dict] | None,
+    account: str,
+) -> dict:
+    """Compute the four multi-hop path-payment cycle features for `account`.
+
+    `path_cycles` is the batch-level output of
+    `detection.path_cycle_detector.detect_path_payment_cycles`. When it is not
+    supplied but `path_payments` are, the cycle search is run on demand; passing
+    precomputed cycles avoids re-running Johnson's algorithm per account.
+    """
+    from detection.path_cycle_detector import detect_cycles_from_payments, path_cycle_features
+
+    zero = {name: 0.0 for name in PATH_PAYMENT_CYCLE_FEATURE_NAMES}
+    if path_cycles is None:
+        if not path_payments:
+            return zero
+        path_cycles = detect_cycles_from_payments(path_payments)
+
+    return path_cycle_features(path_cycles, account)
+
+
 def sandwich_features(
     trades: pd.DataFrame,
     account: str,
@@ -715,6 +745,7 @@ def _build_feature_vector_base(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    path_cycles: list[dict] | None = None,
     ring_membership: dict[str, dict] | None = None,
     prices: pd.DataFrame | None = None,
     pair: str | None = None,
@@ -766,6 +797,7 @@ def _build_feature_vector_base(
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
     features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
     features.update(path_payment_features(path_payments, account))
+    features.update(path_payment_cycle_features(path_payments, path_cycles, account))
     features.update(causal_features(trades, account, prices, pair))
     features.update(multivariate_benford_features(account, trades_by_pair))
     features.update(sandwich_features(trades, account, as_of))
@@ -791,7 +823,9 @@ GNN_FEATURE_NAMES = [
     "gnn_neighbor_avg_score",
 ]
 
-FEATURE_NAMES = FEATURE_NAMES + GNN_FEATURE_NAMES
+# Path-payment cycle features are appended after GNN features so that existing
+# model checkpoints stay loadable (old models default these to 0.0 at inference).
+FEATURE_NAMES = FEATURE_NAMES + GNN_FEATURE_NAMES + PATH_PAYMENT_CYCLE_FEATURE_NAMES
 
 
 def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None, **kwargs):

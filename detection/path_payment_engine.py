@@ -8,6 +8,8 @@ invisible to single-account, consecutive-trade detectors. This module flags
 that pattern directly from `ingestion.data_models.PathPayment` records.
 """
 
+import pandas as pd
+
 from ingestion.data_models import PathPayment
 
 
@@ -40,3 +42,32 @@ def detect_atomic_circular_routes(path_payments: list[PathPayment]) -> list[dict
             }
         )
     return routes
+
+
+def analyze_path_payments(
+    path_payments: list[PathPayment],
+    root_accounts: set[str] | None = None,
+    max_cycle_length: int = 6,
+    max_time_window: pd.Timedelta = pd.Timedelta(hours=24),
+    min_cycle_xlm: float = 0.0,
+) -> dict:
+    """Run both detectors over a batch of path payments.
+
+    Returns the per-transaction atomic circular routes (the legacy single-op
+    pattern) alongside the multi-hop cross-operation cycles surfaced by
+    `path_cycle_detector`. Keeping the cycle search behind this single entry
+    point lets `run_pipeline` build the graph once per batch rather than per
+    account.
+    """
+    from detection.path_cycle_detector import detect_cycles_from_payments
+
+    return {
+        "atomic_routes": detect_atomic_circular_routes(path_payments),
+        "cycles": detect_cycles_from_payments(
+            path_payments,
+            root_accounts=root_accounts,
+            max_cycle_length=max_cycle_length,
+            max_time_window=max_time_window,
+            min_cycle_xlm=min_cycle_xlm,
+        ),
+    }

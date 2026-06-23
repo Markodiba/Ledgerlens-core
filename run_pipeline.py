@@ -27,13 +27,16 @@ from detection.feature_engineering import build_feature_vector
 from detection.feature_store import FeatureStore
 from detection.graph_engine import build_ring_membership_index, build_transaction_graph, find_wash_rings
 from detection.model_inference import load_calibration, load_models, score_feature_matrix, score_feature_vector, score_with_uncertainty
+from detection.path_cycle_detector import detect_cycles_from_payments, path_payment_cycles_to_alerts
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.risk_score import RiskScore
 from detection.storage import (
+    save_alerts,
     save_circular_routes,
     save_feature_vectors,
     save_liquidity_pool_trades,
     save_pair_correlations,
+    save_path_payment_cycles,
     save_path_payments,
     save_rings,
     save_scores,
@@ -204,6 +207,9 @@ def run(
         save_path_payments(path_payments)
         circular_routes = detect_atomic_circular_routes(path_payments)
         save_circular_routes(circular_routes)
+        path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
+        save_path_payment_cycles(path_cycles)
+        save_alerts(path_payment_cycles_to_alerts(path_cycles))
 
         for account in accounts:
             features = build_feature_vector(
@@ -216,6 +222,7 @@ def run(
                 correlated_pairs=correlated_pairs if multi_pair else None,
                 cross_pair_wallets=cross_pair_wallets_map if multi_pair else None,
                 path_payments=path_payments,
+                path_cycles=path_cycles,
                 ring_membership=_ring_membership,
             )
             if calibrators:
@@ -407,6 +414,9 @@ async def async_run(
             save_path_payments(path_payments)
             circular_routes = detect_atomic_circular_routes(path_payments)
             save_circular_routes(circular_routes)
+            path_cycles = detect_cycles_from_payments(path_payments, root_accounts=set(accounts))
+            save_path_payment_cycles(path_cycles)
+            save_alerts(path_payment_cycles_to_alerts(path_cycles))
 
             feature_vectors = [
                 build_feature_vector(
@@ -416,6 +426,7 @@ async def async_run(
                     order_book_events=order_book_events,
                     account_metadata=account_metadata,
                     path_payments=path_payments,
+                    path_cycles=path_cycles,
                 )
                 for account in accounts
             ]

@@ -68,6 +68,69 @@ def build_transaction_graph(trades: pd.DataFrame) -> nx.DiGraph:
     return graph
 
 
+def add_path_payment_edges(graph: nx.DiGraph, payments: pd.DataFrame) -> None:
+    """Add directed account-to-account edges for each path payment operation.
+
+    Unlike `build_transaction_graph` (which models direct SDEX counterparties),
+    a path payment routes value from `source_account` to `destination_account`
+    through one or more intermediary assets in a single atomic operation. A wash
+    trader chains several such operations across colluding sub-accounts so the
+    funds return to the originator without ever producing a direct wash-trade
+    edge. Modelling each operation as a `source_account -> destination_account`
+    edge lets the cycle search in `path_cycle_detector` recover those rings.
+
+    `payments` is a DataFrame with the columns `source_account`,
+    `destination_account`, `source_asset`, `destination_asset`,
+    `source_amount`, `timestamp` (and optionally `transaction_hash`). Multiple
+    payments between the same ordered pair accumulate on a single edge; each
+    individual hop is retained under the edge's `path_payments` attribute so the
+    cycle search can pick a time-ordered traversal.
+    """
+    if payments.empty:
+        return
+
+    required = {"source_account", "destination_account"}
+    missing = required - set(payments.columns)
+    if missing:
+        raise ValueError(f"payments is missing required columns: {sorted(missing)}")
+
+    has_tx_hash = "transaction_hash" in payments.columns
+    for row in payments.itertuples(index=False):
+        source = str(getattr(row, "source_account"))
+        destination = str(getattr(row, "destination_account"))
+        if not source or not destination:
+            continue
+
+        amount = float(getattr(row, "source_amount", 0.0) or 0.0)
+        source_asset = str(getattr(row, "source_asset", "") or "")
+        destination_asset = str(getattr(row, "destination_asset", "") or "")
+        raw_ts = getattr(row, "timestamp", None)
+        timestamp = pd.Timestamp(raw_ts) if raw_ts is not None and not pd.isna(raw_ts) else None
+        tx_hash = str(getattr(row, "transaction_hash")) if has_tx_hash else None
+
+        hop = {
+            "amount_xlm": amount,
+            "source_asset": source_asset,
+            "destination_asset": destination_asset,
+            "timestamp": timestamp,
+            "transaction_hash": tx_hash,
+        }
+
+        if graph.has_edge(source, destination):
+            edge = graph[source][destination]
+            edge["total_volume"] = float(edge.get("total_volume", 0.0)) + amount
+            edge["payment_count"] = int(edge.get("payment_count", 0)) + 1
+            edge.setdefault("path_payments", []).append(hop)
+        else:
+            graph.add_edge(
+                source,
+                destination,
+                total_volume=amount,
+                payment_count=1,
+                path_payments=[hop],
+            )
+
+
 def find_wash_rings(
     graph: nx.DiGraph,
     min_ring_size: int = 3,

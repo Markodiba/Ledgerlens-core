@@ -42,6 +42,7 @@ class AlertType(str, Enum):
     CIRCULAR_ROUTE = "CIRCULAR_ROUTE"
     POOL_MANIPULATION = "POOL_MANIPULATION"
     SANDWICH_ATTACK = "SANDWICH_ATTACK"
+    PATH_PAYMENT_CYCLE = "PATH_PAYMENT_CYCLE"
 
 
 class SchemaMigrationError(RuntimeError):
@@ -350,6 +351,25 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_alerts_wallet ON alerts (wallet);
         CREATE INDEX IF NOT EXISTS idx_alerts_alert_type ON alerts (alert_type);
         CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp);
+        """,
+    ),
+    (
+        12,
+        "add path_payment_cycles table for multi-hop cycle detection",
+        """
+        CREATE TABLE IF NOT EXISTS path_payment_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            accounts_json TEXT NOT NULL,
+            cycle_path_json TEXT NOT NULL,
+            cycle_value_xlm REAL NOT NULL,
+            cycle_length INTEGER NOT NULL,
+            completed_in_seconds REAL NOT NULL,
+            asset_diversity INTEGER NOT NULL,
+            cycle_metadata_json TEXT NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_path_payment_cycles_detected_at
+            ON path_payment_cycles (detected_at);
         """,
     ),
 ]
@@ -1138,6 +1158,77 @@ def get_circular_routes(
             "is_atomic_self_payment": bool(row[4]),
             "touches_pool": bool(row[5]),
             "timestamp": row[6],
+        }
+        for row in rows
+    ]
+
+
+def save_path_payment_cycles(cycles: list[dict], db_path: str | None = None) -> None:
+    """Persist `detect_path_payment_cycles` output from the latest pipeline run.
+
+    The full cycle dict is stored in `cycle_metadata_json` so consumers can
+    recover the originating account, transaction hashes and asset hops; the
+    scalar columns mirror the alert detail for cheap filtering/aggregation.
+    """
+    if not cycles:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO path_payment_cycles
+                (accounts_json, cycle_path_json, cycle_value_xlm, cycle_length,
+                 completed_in_seconds, asset_diversity, cycle_metadata_json, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    json.dumps(c.get("accounts", [])),
+                    json.dumps(c.get("cycle_path", [])),
+                    float(c.get("cycle_value_xlm", 0.0)),
+                    int(c.get("cycle_length", 0)),
+                    float(c.get("completed_in_seconds", 0.0)),
+                    int(c.get("asset_diversity", 0)),
+                    json.dumps(c),
+                    ts,
+                )
+                for c in cycles
+            ],
+        )
+        conn.commit()
+
+
+def get_path_payment_cycles(
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return detected multi-hop path-payment cycles, most recent first."""
+    init_db(db_path)
+    query = (
+        "SELECT accounts_json, cycle_path_json, cycle_value_xlm, cycle_length, "
+        "completed_in_seconds, asset_diversity, cycle_metadata_json, detected_at "
+        "FROM path_payment_cycles ORDER BY detected_at DESC, id DESC"
+    )
+    params: list = []
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "accounts": json.loads(row[0]),
+            "cycle_path": json.loads(row[1]),
+            "cycle_value_xlm": row[2],
+            "cycle_length": row[3],
+            "completed_in_seconds": row[4],
+            "asset_diversity": row[5],
+            "metadata": json.loads(row[6]),
+            "detected_at": row[7],
         }
         for row in rows
     ]
