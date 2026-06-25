@@ -138,6 +138,161 @@ def is_anomalous(metrics: dict, mad_threshold: float = 0.015) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Kolmogorov-Smirnov and Kuiper tests for Benford conformity
+# ---------------------------------------------------------------------------
+
+# Benford CDF: F(d) = sum_{k=1}^{d} log10(1 + 1/k) for d = 1..9
+_BENFORD_CDF = np.cumsum([BENFORD_EXPECTED[d] for d in DIGITS])
+
+KS_MIN_N = 5
+
+
+@dataclass
+class KSResult:
+    """Result of a one-sample KS test against the Benford CDF."""
+    d_statistic: float = float("nan")
+    p_value: float = float("nan")
+    ks_flag: bool = False
+    valid: bool = False
+
+
+@dataclass
+class KuiperResult:
+    """Result of a Kuiper test against the Benford CDF."""
+    v_statistic: float = float("nan")
+    p_value: float = float("nan")
+    kuiper_flag: bool = False
+    valid: bool = False
+
+
+def compute_ks_statistic(digit_counts: np.ndarray) -> KSResult:
+    """One-sample KS test of observed digit distribution against Benford CDF.
+
+    ``digit_counts`` must be a length-9 array of non-negative integers (counts
+    for digits 1-9). Valid for N >= 5; returns NaN statistics for smaller samples.
+
+    The KS D-statistic is D = max_d |F_observed(d) - F_benford(d)|.
+    Critical value at alpha=0.05: D_crit = 1.358 / sqrt(N).
+    """
+    digit_counts = np.asarray(digit_counts, dtype=float)
+    if digit_counts.shape != (9,) or np.any(digit_counts < 0):
+        return KSResult()
+
+    n = digit_counts.sum()
+    if n < KS_MIN_N:
+        return KSResult()
+
+    observed_cdf = np.cumsum(digit_counts) / n
+    differences = np.abs(observed_cdf - _BENFORD_CDF)
+    d_stat = float(np.max(differences))
+    d_crit = 1.358 / math.sqrt(n)
+
+    # Approximate p-value using Kolmogorov distribution
+    lam = (math.sqrt(n) + 0.12 + 0.11 / math.sqrt(n)) * d_stat
+    p_value = _ks_pvalue(lam)
+
+    return KSResult(
+        d_statistic=d_stat,
+        p_value=p_value,
+        ks_flag=d_stat > d_crit,
+        valid=True,
+    )
+
+
+def _ks_pvalue(lam: float) -> float:
+    """Approximate survival function of the Kolmogorov distribution."""
+    if lam <= 0:
+        return 1.0
+    p = 0.0
+    for j in range(1, 101):
+        term = ((-1) ** (j - 1)) * math.exp(-2.0 * j * j * lam * lam)
+        p += term
+    p = max(0.0, min(1.0, 2.0 * p))
+    return p
+
+
+def compute_kuiper_statistic(digit_counts: np.ndarray) -> KuiperResult:
+    """Kuiper test of observed digit distribution against Benford CDF.
+
+    The Kuiper V-statistic is V = D_plus + D_minus where
+    D_plus = max(F_obs - F_benford) and D_minus = max(F_benford - F_obs).
+    Rotation-invariant, making it more sensitive to tail deviations (digits 1
+    and 9) where wash-trading bots using round lot sizes tend to deviate.
+
+    Valid for N >= 5.
+    """
+    digit_counts = np.asarray(digit_counts, dtype=float)
+    if digit_counts.shape != (9,) or np.any(digit_counts < 0):
+        return KuiperResult()
+
+    n = digit_counts.sum()
+    if n < KS_MIN_N:
+        return KuiperResult()
+
+    observed_cdf = np.cumsum(digit_counts) / n
+    d_plus = float(np.max(observed_cdf - _BENFORD_CDF))
+    d_minus = float(np.max(_BENFORD_CDF - observed_cdf))
+    v_stat = d_plus + d_minus
+
+    p_value = _kuiper_pvalue(v_stat, int(n))
+
+    return KuiperResult(
+        v_statistic=v_stat,
+        p_value=p_value,
+        kuiper_flag=p_value < 0.05,
+        valid=True,
+    )
+
+
+def _kuiper_pvalue(V: float, N: int) -> float:
+    """Approximate Kuiper survival function P(V > v).
+
+    Uses the series expansion from Press et al., Numerical Recipes, ch. 14.3:
+    P(V > v) = 2 * sum_{j=1}^{100} (4j^2 v^2 - 1) * exp(-2 j^2 v^2)
+    where v = V * (sqrt(N) + 0.155 + 0.24/sqrt(N)).
+    """
+    if V <= 0 or N < 1:
+        return 1.0
+    sqrt_n = math.sqrt(N)
+    v = V * (sqrt_n + 0.155 + 0.24 / sqrt_n)
+    if v <= 0:
+        return 1.0
+
+    p = 0.0
+    for j in range(1, 101):
+        j2v2 = j * j * v * v
+        exp_val = -2.0 * j2v2
+        if exp_val < -300:
+            break
+        term = (4.0 * j2v2 - 1.0) * math.exp(exp_val)
+        p += term
+
+    p = max(0.0, min(1.0, 2.0 * p))
+    return p
+
+
+def compute_benford_ks_kuiper(amounts: List[float]) -> dict:
+    """Compute KS and Kuiper statistics for a list of trade amounts.
+
+    Returns a dict with ks_stat, ks_pval, ks_flag, kuiper_stat, kuiper_pval,
+    kuiper_flag keys.
+    """
+    counts, n = _extract_digit_histogram(amounts)
+
+    ks = compute_ks_statistic(counts)
+    kuiper = compute_kuiper_statistic(counts)
+
+    return {
+        "ks_stat": ks.d_statistic,
+        "ks_pval": ks.p_value,
+        "ks_flag": ks.ks_flag,
+        "kuiper_stat": kuiper.v_statistic,
+        "kuiper_pval": kuiper.p_value,
+        "kuiper_flag": kuiper.kuiper_flag,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Stratified Benford analysis per asset pair
 # ---------------------------------------------------------------------------
 

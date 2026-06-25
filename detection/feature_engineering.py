@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import AdaptiveBenfordWindow, compute_benford_metrics, stratified_benford_analysis
+from detection.benford_engine import (
+    AdaptiveBenfordWindow,
+    compute_benford_ks_kuiper,
+    compute_benford_metrics,
+    stratified_benford_analysis,
+)
 from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
 from detection.sandwich_engine import detect_sandwich_candidates
@@ -55,6 +60,22 @@ BENFORD_STRATUM_FEATURE_NAMES = [
     f"max_stratum_MAD_{window}" for window in ROLLING_WINDOWS
 ] + [
     f"n_flagged_strata_{window}" for window in ROLLING_WINDOWS
+]
+
+# KS and Kuiper test features (4 per window x 5 windows = 20 new)
+BENFORD_KS_KUIPER_FEATURE_NAMES = [
+    f"ks_stat_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"ks_pval_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"kuiper_stat_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"kuiper_pval_{window}" for window in ROLLING_WINDOWS
+]
+
+# Majority-vote combined Benford flag (1 per window x 5 windows = 5 new)
+BENFORD_COMBINED_FLAG_FEATURE_NAMES = [
+    f"benford_combined_flag_{window}" for window in ROLLING_WINDOWS
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -146,6 +167,8 @@ FEATURE_NAMES = (
     + MULTIVARIATE_BENFORD_FEATURE_NAMES
     + BENFORD_WINDOW_EXPANDED_FEATURE_NAMES
     + BENFORD_STRATUM_FEATURE_NAMES
+    + BENFORD_KS_KUIPER_FEATURE_NAMES
+    + BENFORD_COMBINED_FLAG_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -225,7 +248,27 @@ def benford_features(
         features[f"max_stratum_chi2_{label}"] = summary.max_stratum_chi2
         features[f"max_stratum_MAD_{label}"] = summary.max_stratum_MAD
         features[f"n_flagged_strata_{label}"] = float(summary.n_flagged_strata)
+
+        ks_kuiper = compute_benford_ks_kuiper(amounts)
+        features[f"ks_stat_{label}"] = ks_kuiper["ks_stat"] if not _is_nan(ks_kuiper["ks_stat"]) else 0.0
+        features[f"ks_pval_{label}"] = ks_kuiper["ks_pval"] if not _is_nan(ks_kuiper["ks_pval"]) else 1.0
+        features[f"kuiper_stat_{label}"] = ks_kuiper["kuiper_stat"] if not _is_nan(ks_kuiper["kuiper_stat"]) else 0.0
+        features[f"kuiper_pval_{label}"] = ks_kuiper["kuiper_pval"] if not _is_nan(ks_kuiper["kuiper_pval"]) else 1.0
+
+        chi2_flag = metrics["chi_square"] > 15.507
+        ks_flag = ks_kuiper.get("ks_flag", False)
+        kuiper_flag = ks_kuiper.get("kuiper_flag", False)
+        n_flags = sum([chi2_flag, ks_flag, kuiper_flag])
+        features[f"benford_combined_flag_{label}"] = 1.0 if n_flags >= 2 else 0.0
     return features
+
+
+def _is_nan(value: float) -> bool:
+    import math
+    try:
+        return math.isnan(value)
+    except (TypeError, ValueError):
+        return False
 
 
 def counterparty_concentration_ratio(trades: pd.DataFrame, account: str) -> float:
