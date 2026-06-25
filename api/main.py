@@ -129,11 +129,19 @@ def validate_stellar_address(wallet: str) -> None:
 
 _models: dict = {}
 
+# ---------------------------------------------------------------------------
+# Graceful shutdown state
+# ---------------------------------------------------------------------------
+_shutting_down: bool = False
+SHUTDOWN_TIMEOUT = int(os.environ.get("SHUTDOWN_TIMEOUT", "30"))
+_inflight_requests: int = 0
+_inflight_lock = __import__("threading").Lock()
+
 
 @asynccontextmanager
 async def _lifespan(application: FastAPI):
-    """Load trained models at startup; close WebSocket connections at shutdown."""
-    global _models
+    """Load trained models at startup; drain requests and clean up on shutdown."""
+    global _models, _shutting_down
     configure_tracing()
     try:
         from detection.model_inference import load_models
@@ -143,8 +151,53 @@ async def _lifespan(application: FastAPI):
         logger.warning("No trained models loaded from %s (%s) — /explain will return 503", settings.model_dir, e)
         _models = {}
     yield
+
+    # ── Shutdown sequence ────────────────────────────────────────────────
+    import asyncio
+
+    _shutting_down = True
+    logger.info("[shutdown] Stopping new requests (returning 503)")
+
+    # Wait for in-flight requests to drain
+    deadline = time.monotonic() + SHUTDOWN_TIMEOUT
+    while time.monotonic() < deadline:
+        with _inflight_lock:
+            count = _inflight_requests
+        if count == 0:
+            logger.info("[shutdown] All in-flight requests drained")
+            break
+        await asyncio.sleep(0.25)
+    else:
+        with _inflight_lock:
+            count = _inflight_requests
+        if count > 0:
+            logger.warning("[shutdown] Timed out with %d in-flight requests", count)
+
+    # Close WebSocket connections
     from api.ws_router import manager as _ws_manager
     await _ws_manager.close_all()
+    logger.info("[shutdown] WebSocket connections closed")
+
+    # SQLite WAL checkpoint
+    try:
+        from detection.storage import _connect
+        with _connect() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        logger.info("[shutdown] SQLite WAL checkpoint complete")
+    except Exception as exc:
+        logger.warning("[shutdown] SQLite WAL checkpoint failed: %s", exc)
+
+    # Flush Redis connection if available
+    try:
+        from detection.feature_store import FeatureStore
+        fs = FeatureStore.__dict__.get("_instance")
+        if fs and hasattr(fs, "_redis") and fs._redis:
+            fs._redis.close()
+            logger.info("[shutdown] Redis connection closed")
+    except Exception as exc:
+        logger.warning("[shutdown] Redis cleanup failed: %s", exc)
+
+    logger.info("[shutdown] Shutdown sequence complete")
 
 
 app = FastAPI(
@@ -153,6 +206,26 @@ app = FastAPI(
     version="1.0.0",
     lifespan=_lifespan,
 )
+
+
+@app.middleware("http")
+async def _shutdown_guard_middleware(request: Request, call_next):
+    """Reject new requests during shutdown; track in-flight count."""
+    global _inflight_requests
+    if _shutting_down and not request.url.path.startswith("/health"):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Server is shutting down."},
+            headers={"Retry-After": "5"},
+        )
+    with _inflight_lock:
+        _inflight_requests += 1
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        with _inflight_lock:
+            _inflight_requests -= 1
 
 
 @app.exception_handler(sqlite3.OperationalError)
@@ -291,6 +364,17 @@ def _model_file_ok(path: str) -> bool:
         return os.path.isfile(path) and os.path.getsize(path) > 0
     except OSError:
         return False
+
+
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Kubernetes readiness probe. Returns 503 during shutdown."""
+    if _shutting_down:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "shutting_down"},
+        )
+    return JSONResponse(status_code=200, content={"status": "ready"})
 
 
 @v1_router.get("/scores", response_model=list[RiskScore])

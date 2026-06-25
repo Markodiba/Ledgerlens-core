@@ -19,6 +19,7 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 - `GET /cross-chain/links/{stellar_wallet}/explain` endpoint (admin-key gated) returning evidence feature breakdown.
 - `cross_chain_link_confidence` feature added to the cross-chain feature vector in `feature_engineering.py`.
 - `CROSS_CHAIN_TIMING_SIGMA_SECONDS`, `CROSS_CHAIN_AMOUNT_TOLERANCE`, `CROSS_CHAIN_MIN_CONFIDENCE`, `CROSS_CHAIN_CONFIRMED_CONFIDENCE` configuration variables.
+- **Graceful shutdown**: SIGTERM/SIGINT stops accepting new requests (503), drains in-flight requests with configurable `SHUTDOWN_TIMEOUT` (default 30s), checkpoints SQLite WAL, and closes Redis/WebSocket connections. `GET /health/ready` returns 503 during shutdown for Kubernetes readiness probes.
 - **Backtesting framework** (`backtesting/backtest_runner.py`): loads labelled CSV datasets, runs the full feature extraction and scoring pipeline, and computes precision/recall/F1/AUC-ROC/average precision at configurable thresholds.
 - `cli.py backtest run` command for running backtests from the command line.
 - Synthetic labelled dataset in `data/backtest/known_cases.csv` for CI validation.
