@@ -172,6 +172,30 @@ def _run_retrain(job_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# GET /admin/shadow/report
+# ---------------------------------------------------------------------------
+
+
+@router.get("/shadow/report", include_in_schema=False)
+def shadow_report() -> dict:
+    """Return shadow model scoring report: mean divergence, p95, high-divergence wallets."""
+    from detection.shadow_scoring import get_shadow_model_version, get_shadow_report
+
+    version = get_shadow_model_version()
+    if not version:
+        raise HTTPException(status_code=404, detail="Shadow mode not active (SHADOW_MODEL_VERSION not set)")
+
+    report = get_shadow_report(settings.db_path)
+    report["shadow_model_version"] = version
+    return report
+
+
+# ---------------------------------------------------------------------------
+# POST /admin/retrain
+# ---------------------------------------------------------------------------
+
+
 @router.post("/retrain", include_in_schema=False)
 def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     """Enqueue an async retraining job and return its job ID."""
