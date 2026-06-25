@@ -69,12 +69,19 @@ AMM_FEATURE_NAMES = [
     "pool_trade_ratio",  # fraction of an account's volume that is pool, not orderbook
     "pool_round_trip_ratio",
     "pool_share_concentration",
+    "deposit_withdraw_imbalance",
+    "pool_self_swap_rate",
+    "round_trip_via_pool",
 ]
 
 PATH_PAYMENT_FEATURE_NAMES = [
     "atomic_self_payment_ratio",  # fraction of an account's path payments where source==destination
     "avg_path_hop_count",
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
+]
+
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_prob",
 ]
 
 FEATURE_NAMES = (
@@ -85,6 +92,7 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + GNN_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -411,14 +419,15 @@ def amm_features(
     account: str,
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
+    pool_events: list | None = None,
 ) -> dict:
-    """Compute the three AMM pool features for `account`.
+    """Compute AMM pool features for `account`.
 
     `pool_trade_ratio` and `pool_round_trip_ratio` are derived from `trades`
     alone (rows with `trade_type == LIQUIDITY_POOL`). `pool_share_concentration`
-    additionally needs `liquidity_pools` (id -> `LiquidityPool`) and
-    `pool_deposits` (id -> deposit/withdraw DataFrame); omitting either yields
-    `0.0` for that feature.
+    additionally needs `liquidity_pools` and `pool_deposits`. The three new
+    AMM-specific features use `pool_events` (list of `LiquidityPoolEvent`).
+    Omitting optional inputs yields `0.0` for dependent features.
     """
     zero = {name: 0.0 for name in AMM_FEATURE_NAMES}
     if trades.empty or "trade_type" not in trades.columns:
@@ -448,10 +457,49 @@ def amm_features(
                 concentrations.append(pool_share_concentration(pool, deposits))
     avg_concentration = float(sum(concentrations) / len(concentrations)) if concentrations else 0.0
 
+    # AMM-specific features from deposit/withdraw event stream
+    deposit_withdraw_imbalance = 0.0
+    pool_self_swap_rate = 0.0
+    round_trip_via_pool = 0.0
+
+    if pool_events:
+        from ingestion.data_models import LiquidityPoolEventType
+        acct_events = [e for e in pool_events if e.account == account]
+        if acct_events:
+            deposits = sum(1 for e in acct_events if e.event_type == LiquidityPoolEventType.DEPOSIT)
+            withdrawals = sum(1 for e in acct_events if e.event_type == LiquidityPoolEventType.WITHDRAW)
+            total_events = deposits + withdrawals
+            if total_events > 0:
+                deposit_withdraw_imbalance = abs(deposits - withdrawals) / total_events
+
+        n_pool_trades = len(pool_trades)
+        if n_pool_trades > 0:
+            # Self-swap: buy and sell same asset pair within the same pool in short window
+            self_swaps = 0
+            window = pd.Timedelta(hours=1)
+            sorted_pt = pool_trades.sort_values("ledger_close_time").reset_index(drop=True)
+            for i in range(len(sorted_pt)):
+                row_i = sorted_pt.iloc[i]
+                t_i = pd.Timestamp(row_i["ledger_close_time"])
+                for j in range(i + 1, len(sorted_pt)):
+                    row_j = sorted_pt.iloc[j]
+                    t_j = pd.Timestamp(row_j["ledger_close_time"])
+                    if t_j - t_i > window:
+                        break
+                    if row_i.get("liquidity_pool_id") == row_j.get("liquidity_pool_id"):
+                        self_swaps += 1
+            pool_self_swap_rate = float(self_swaps / n_pool_trades)
+
+            # round_trip_via_pool: 1 if avg_round_trip > 0, else 0
+            round_trip_via_pool = 1.0 if avg_round_trip > 0.0 else 0.0
+
     return {
         "pool_trade_ratio": pool_trade_ratio,
         "pool_round_trip_ratio": avg_round_trip,
         "pool_share_concentration": avg_concentration,
+        "deposit_withdraw_imbalance": deposit_withdraw_imbalance,
+        "pool_self_swap_rate": pool_self_swap_rate,
+        "round_trip_via_pool": round_trip_via_pool,
     }
 
 
@@ -493,6 +541,8 @@ def build_feature_vector(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    pool_events: list | None = None,
+    gnn_scores: dict[str, float] | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -512,6 +562,9 @@ def build_feature_vector(
     `liquidity_pools`, `pool_deposits`, and `path_payments` are optional;
     omitting them yields `0.0` for the AMM/path-payment features that depend
     on them.
+
+    `gnn_scores` is a wallet->probability mapping from `GNNInferenceEngine.score_graph`;
+    omitting it yields `0.0` for `gnn_wash_ring_prob`.
     """
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
@@ -534,8 +587,9 @@ def build_feature_vector(
     )
     features.update(graph_ring_features(account, ring_membership))
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
-    features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
+    features.update(amm_features(trades, account, liquidity_pools, pool_deposits, pool_events))
     features.update(path_payment_features(path_payments, account))
+    features["gnn_wash_ring_prob"] = float((gnn_scores or {}).get(account, 0.0))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
     return features

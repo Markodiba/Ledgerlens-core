@@ -9,9 +9,10 @@ for the cross-repo data contract.
 """
 
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class Asset(BaseModel):
@@ -95,3 +96,30 @@ class OrderBookEvent(BaseModel):
     amount: float
     price: float
     event_type: str  # "created" | "updated" | "cancelled"
+
+
+class PoolReserve(BaseModel):
+    asset: str  # e.g. "native" or "USDC:GABC..."
+    amount: Decimal
+
+
+class LiquidityPoolEventType(str, Enum):
+    DEPOSIT = "liquidity_pool_deposit"
+    WITHDRAW = "liquidity_pool_withdraw"
+
+
+class LiquidityPoolEvent(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    paging_token: str
+    transaction_hash: str
+    ledger_close_time: datetime
+    pool_id: str
+    account: str
+    event_type: LiquidityPoolEventType
+    reserves_deposited: list[PoolReserve] | None = None
+    reserves_received: list[PoolReserve] | None = None
+    shares_amount: Decimal
+    min_price: Decimal | None = None
+    max_price: Decimal | None = None
