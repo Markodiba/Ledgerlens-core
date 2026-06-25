@@ -1,4 +1,4 @@
-.PHONY: install test lint generate-data train serve benchmark benchmark-check
+.PHONY: install test lint mutation-test generate-data train serve
 
 install:
 	pip install -r requirements.txt
@@ -9,6 +9,11 @@ test:
 lint:
 	ruff check .
 
+mutation-test:
+	mutmut run --paths-to-mutate detection/benford_engine.py,detection/graph_engine.py,detection/model_inference.py
+	@echo "=== Mutation Results ==="
+	mutmut results --all
+
 generate-data:
 	python3 cli.py generate-data
 
@@ -18,14 +23,17 @@ train:
 serve:
 	python3 cli.py serve --reload
 
-# Re-measures the scoring pipeline benchmarks and overwrites
-# benchmarks/baseline.json with the result. Run this after an intentional
-# performance change so future CI runs compare against the new baseline.
-benchmark:
-	python3 benchmarks/benchmark_scoring.py --update-baseline
+# ── Chaos engineering ────────────────────────────────────────────────────────
+# Requires Docker + Docker Compose. Starts Toxiproxy + Redis, runs chaos suite,
+# then tears down. Set LEDGERLENS_ADMIN_API_KEY before running.
+test-chaos:
+	docker compose --profile chaos up -d --wait
+	pytest tests/chaos/ -m chaos -v --tb=short --timeout=120 || (docker compose --profile chaos down && exit 1)
+	docker compose --profile chaos down
 
-# Measures the scoring pipeline benchmarks and compares against the
-# committed benchmarks/baseline.json, failing if p99 regresses > 20% or
-# batch scoring stops scaling linearly. This is what CI runs.
-benchmark-check:
-	python3 benchmarks/benchmark_scoring.py
+# ── Documentation ────────────────────────────────────────────────────────────
+docs:
+	mkdocs build
+
+docs-serve:
+	mkdocs serve
