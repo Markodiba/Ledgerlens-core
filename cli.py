@@ -813,6 +813,41 @@ def federated_join(
 config_app = typer.Typer(help="Configuration commands")
 app.add_typer(config_app, name="config")
 
+db_app = typer.Typer(help="Database maintenance commands")
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("retention")
+def db_retention(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be archived without making changes"),
+    archive_root: str = typer.Option("./data/archive", "--archive-root", help="Root directory for Parquet archives"),
+    db_path: str = typer.Option(None, "--db-path", help="Path to SQLite database (defaults to LEDGERLENS_DB_PATH)"),
+) -> None:
+    """Archive records older than their TTL to Parquet and purge from SQLite.
+
+    Default TTLs: risk_scores=365d, feature_vectors=90d, alerts=730d.
+    Use --dry-run to preview the archival plan without modifying the database.
+    """
+    from config.settings import settings as cfg
+    from storage.retention import RetentionEngine
+
+    engine = RetentionEngine(db_path=db_path or cfg.db_path, archive_root=archive_root)
+    report = engine.run(dry_run=dry_run)
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    for table, info in report.items():
+        archived = info.get("rows_archived", 0)
+        cutoff = info.get("cutoff_date", "")
+        if info.get("skipped"):
+            typer.echo(f"{prefix}{table}: table not found — skipped")
+        elif archived == 0:
+            typer.echo(f"{prefix}{table}: no rows older than {cutoff}")
+        elif dry_run:
+            typer.echo(f"{prefix}{table}: would archive {archived} rows older than {cutoff}")
+        else:
+            path = info.get("archive_path", "")
+            typer.echo(f"{prefix}{table}: archived {archived} rows → {path}")
+
 
 @config_app.command("validate")
 def config_validate() -> None:

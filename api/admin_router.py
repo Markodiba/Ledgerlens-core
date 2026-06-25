@@ -178,3 +178,17 @@ def trigger_retrain(background_tasks: BackgroundTasks) -> dict:
     job_id = str(uuid.uuid4())
     background_tasks.add_task(_run_retrain, job_id)
     return {"job_id": job_id, "status": "queued"}
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/storage  (Issue #180)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/storage", include_in_schema=False)
+def storage_stats() -> dict:
+    """Return current database size, per-table row counts, and next archival date."""
+    from storage.retention import RetentionEngine
+
+    engine = RetentionEngine(db_path=settings.db_path)
+    return engine.storage_stats()
