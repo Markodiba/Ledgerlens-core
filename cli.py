@@ -56,8 +56,16 @@ def train(
     ring_size: int = typer.Option(3, help="Accounts per wash ring"),
     seed: int = typer.Option(42, help="Random seed for reproducibility"),
     calibrate: bool = typer.Option(True, "--calibrate/--no-calibrate", help="Run conformal calibration after training"),
+    optimize: bool = typer.Option(False, "--optimize", help="Run Optuna Bayesian hyperparameter optimization before training"),
+    n_trials: int = typer.Option(100, "--n-trials", help="Number of Optuna trials per model (max 1000)"),
+    timeout: int = typer.Option(1800, "--timeout", help="Optuna wall-clock timeout in seconds per model (max 86400)"),
 ) -> None:
-    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`."""
+    """Train the RF/XGBoost/LightGBM ensemble on a synthetic dataset and save it to `MODEL_DIR`.
+
+    Use --optimize to run 100-trial Bayesian hyperparameter optimization (Optuna TPE)
+    before final training. Override trial budget with --n-trials and wall-clock cap
+    with --timeout.
+    """
     import os
 
     from config.settings import settings
@@ -75,6 +83,29 @@ def train(
     training_dataset_path = os.path.join(settings.model_dir, "training_reference.csv")
     df.to_csv(training_dataset_path, index=False)
     logger.info("Saved training reference to %s", training_dataset_path)
+
+    if optimize:
+        from detection.feature_engineering import FEATURE_NAMES as _FN
+        from detection.model_training import (
+            _save_best_hyperparams,
+            optimize_hyperparameters,
+        )
+
+        X = df[_FN].fillna(0.0).values
+        y = df["label"].values
+        best_params: dict = {}
+        best_auc_pr: dict = {}
+        n_trials_completed: dict = {}
+        for model_name in ("random_forest", "xgboost", "lightgbm"):
+            logger.info("Optimizing %s (%d trials, %ds timeout)...", model_name, n_trials, timeout)
+            params = optimize_hyperparameters(
+                model_name, X, y, n_trials=n_trials, timeout_seconds=timeout,
+            )
+            best_params[model_name] = params
+            best_auc_pr[model_name] = 0.0
+            n_trials_completed[model_name] = n_trials
+        _save_best_hyperparams(best_params, best_auc_pr, n_trials_completed)
+        logger.info("Hyperparameter optimization complete")
 
     results = train_ensemble(df, calibrate=calibrate)
     for name, result in results.items():
