@@ -203,6 +203,19 @@ def compute_benford_metrics(amounts: list[float]) -> dict:
     observed = digit_distribution(amounts)
     n = sum(1 for a in amounts if first_digit(a) is not None)
 
+    # With no valid samples the observed distribution is all-zeros, which
+    # produces MAD ≈ 0.248 (mean of Benford expected values) even though
+    # there is nothing to analyse.  Return 0.0 to stay consistent with
+    # chi_square_statistic, which already short-circuits to 0.0 when n=0.
+    if n == 0:
+        return {
+            "chi_square": 0.0,
+            "mad": 0.0,
+            "z_scores": {d: 0.0 for d in DIGITS},
+            "observed_distribution": observed,
+            "sample_size": 0,
+        }
+
     return {
         "chi_square": chi_square_statistic(observed, n),
         "mad": mean_absolute_deviation(observed),
