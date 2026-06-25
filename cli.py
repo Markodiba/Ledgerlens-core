@@ -841,5 +841,26 @@ def config_validate() -> None:
         typer.echo(f"  {name}={value}")
 
 
+api_app = typer.Typer(help="API utility commands")
+app.add_typer(api_app, name="api")
+
+
+@api_app.command("export-schema")
+def api_export_schema(
+    output: str = typer.Option("docs/openapi.json", "--output", "-o", help="Output path for the OpenAPI JSON schema"),
+) -> None:
+    """Export the OpenAPI 3.1 schema to a JSON file."""
+    import json
+    import os
+
+    from api.main import app as fastapi_app
+
+    schema = fastapi_app.openapi()
+    os.makedirs(os.path.dirname(output) if os.path.dirname(output) else ".", exist_ok=True)
+    with open(output, "w") as f:
+        json.dump(schema, f, indent=2)
+    typer.echo(f"OpenAPI schema exported to {output}")
+
+
 if __name__ == "__main__":
     app()
