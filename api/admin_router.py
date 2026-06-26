@@ -16,6 +16,7 @@ from slowapi.util import get_remote_address
 from api.auth import require_admin_key
 from config.settings import settings, _runtime_cache
 from detection.model_registry import get_current_version, list_model_versions
+from detection.storage import get_krum_aggregation_log
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_key)])
 

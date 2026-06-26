@@ -1850,6 +1850,72 @@ def get_hop_payment_cycles(
     ]
 
 
+def log_krum_aggregation(
+    round_number: int,
+    n_clients: int,
+    f_tolerance: int,
+    m_selected: int,
+    selected_indices: list,
+    excluded_indices: list,
+    krum_scores: list,
+    db_path: str | None = None,
+) -> None:
+    """Persist one Krum aggregation round decision to fl_aggregation_log."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO fl_aggregation_log
+              (round_number, n_clients, f_tolerance, m_selected,
+               selected_indices, excluded_indices, krum_scores, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                round_number,
+                n_clients,
+                f_tolerance,
+                m_selected,
+                json.dumps(selected_indices),
+                json.dumps(excluded_indices),
+                json.dumps([float(s) for s in krum_scores]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def get_krum_aggregation_log(
+    limit: int = 10,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the most recent Krum aggregation rounds, newest first."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT round_number, n_clients, f_tolerance, m_selected,
+                   selected_indices, excluded_indices, krum_scores, recorded_at
+            FROM fl_aggregation_log
+            ORDER BY round_number DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "round_number": r[0],
+            "n_clients": r[1],
+            "f_tolerance": r[2],
+            "m_selected": r[3],
+            "selected_indices": json.loads(r[4]),
+            "excluded_indices": json.loads(r[5]),
+            "krum_scores": json.loads(r[6]),
+            "recorded_at": r[7],
+        }
+        for r in rows
+    ]
+
+
 if __name__ == "__main__":
     init_db()
     print(f"Initialized risk score database at {settings.db_path}")
