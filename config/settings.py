@@ -6,6 +6,7 @@ error listing every problem at once.
 """
 
 import time
+from pathlib import Path
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,6 +51,19 @@ class Settings(BaseSettings):
     horizon_url: str = "https://horizon.stellar.org"
     horizon_stream_url: str = "https://horizon.stellar.org"
     network: str = "testnet"
+    horizon_default_cursor: str = "now"  # Used when no valid checkpoint exists.
+    data_dir: str = "./data"  # Root allowed to contain runtime data files.
+    cursor_checkpoint_path: str = "./data/horizon_cursor.json"  # Durable SSE offset.
+    cursor_flush_events: int = 100  # Persist after this many processed events.
+    cursor_flush_seconds: float = 10.0  # Persist after this many seconds.
+    horizon_rate_limit: float = 50.0
+    horizon_rate_bucket_capacity: float = 100.0
+    streamer_queue_maxsize: int = 1000  # Hard cap on buffered Horizon trades.
+    streamer_overflow_strategy: str = "drop_oldest"  # block/drop_newest/drop_oldest.
+    streamer_high_water_ratio: float = 0.8  # Begin producer throttling at 80%.
+    rate_restore_seconds: float = 60.0
+    stream_checkpoint_interval: int = 100
+    stream_score_delta_threshold: int = 5
 
     # ── Polling ───────────────────────────────────────────────────────────────
     poll_interval_seconds: int = 5
@@ -128,7 +142,9 @@ class Settings(BaseSettings):
                      "feature_store_ttl_hours", "feature_store_flush_interval_seconds",
                      "soroban_circuit_reset_seconds", "evm_lookback_blocks",
                      "committee_quorum", "committee_vote_deadline_days",
-                     "federated_min_participants", mode="before")
+                     "federated_min_participants", "cursor_flush_events",
+                     "stream_checkpoint_interval", "streamer_queue_maxsize",
+                     mode="before")
     @classmethod
     def must_be_positive(cls, v: object) -> object:
         if int(v) <= 0:
@@ -166,6 +182,41 @@ class Settings(BaseSettings):
         if float(v) < 0:
             raise ValueError("must be >= 0")
         return v
+
+    @field_validator("cursor_flush_seconds", mode="before")
+    @classmethod
+    def positive_cursor_flush_seconds(cls, v: object) -> object:
+        if float(v) <= 0:
+            raise ValueError("CURSOR_FLUSH_SECONDS must be positive")
+        return v
+
+    @field_validator("streamer_overflow_strategy", mode="before")
+    @classmethod
+    def valid_streamer_overflow_strategy(cls, v: object) -> object:
+        strategy = str(v).strip().lower()
+        if strategy not in {"block", "drop_newest", "drop_oldest"}:
+            raise ValueError(
+                "STREAMER_OVERFLOW_STRATEGY must be block, drop_newest, or drop_oldest"
+            )
+        return strategy
+
+    @field_validator("streamer_high_water_ratio", mode="before")
+    @classmethod
+    def valid_streamer_high_water_ratio(cls, v: object) -> object:
+        ratio = float(v)
+        if not 0 < ratio <= 1:
+            raise ValueError("STREAMER_HIGH_WATER_RATIO must be in (0, 1]")
+        return ratio
+
+    @field_validator("horizon_default_cursor", mode="before")
+    @classmethod
+    def valid_horizon_default_cursor(cls, v: object) -> object:
+        import re
+
+        cursor = str(v).strip()
+        if cursor != "now" and re.fullmatch(r"\d+-\d+", cursor) is None:
+            raise ValueError("HORIZON_DEFAULT_CURSOR must be 'now' or a paging token")
+        return cursor
 
     @field_validator("ensemble_weight_rf", "ensemble_weight_xgb", "ensemble_weight_lgbm",
                      mode="before")
@@ -210,6 +261,22 @@ class Settings(BaseSettings):
                 "LEDGERLENS_CORS_ALLOWED_ORIGINS must not contain '*'. "
                 "Specify an explicit origin list instead."
             )
+        return self
+
+    @model_validator(mode="after")
+    def checkpoint_path_is_inside_data_directory(self) -> "Settings":
+        data_root = Path(self.data_dir).expanduser().resolve()
+        checkpoint = Path(self.cursor_checkpoint_path).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = (Path.cwd() / checkpoint).resolve()
+        else:
+            checkpoint = checkpoint.resolve()
+        try:
+            checkpoint.relative_to(data_root)
+        except ValueError as exc:
+            raise ValueError(
+                "CURSOR_CHECKPOINT_PATH must remain inside DATA_DIR"
+            ) from exc
         return self
 
     @model_validator(mode="after")

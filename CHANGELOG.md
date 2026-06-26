@@ -12,16 +12,8 @@ commit, generates this file, and publishes a tagged Docker image to GHCR.
 ## Unreleased
 
 ### Added
-- **#143** `SorobanPublisher` half-open circuit breaker state machine (`detection/soroban_publisher.py`): transitions `open → half-open` after `SOROBAN_CIRCUIT_RESET_SECONDS`; probe success → `closed`; probe failure → `open` (timer reset); manual `reset_circuit()` closes immediately.
-- **#143** `SorobanHealthStatus` dataclass and `SorobanPublisher.health()` / `reset_circuit()` methods for observable circuit state.
-- **#143** `soroban_dead_letters` SQLite table (migration 14): open-circuit submissions written as `pending` DLQ rows instead of silently dropped.
-- **#143** `SorobanPublisher._write_dead_letter()` persists failed submissions to DLQ; prunes to `SOROBAN_DLQ_MAX_ROWS`.
-- **#143** `GET /admin/soroban/health`, `POST /admin/soroban/reset` (rate-limited 10/min), `GET /admin/soroban/dead-letters` admin-key-gated API endpoints (`api/admin_router.py`).
-- **#143** `cli.py dlq-replay` command: replays pending DLQ items oldest-first, marks `replayed`/`failed`, supports `--dry-run` and `--limit`.
-- **#143** `SOROBAN_DLQ_MAX_ROWS` env var in `.env.example`.
-- **#143** `docs/soroban_operations.md`: circuit breaker states, health endpoint interpretation, DLQ replay procedure, manual reset runbook.
-
-### Added
+- **#144** `tests/test_webhook_security.py`: exhaustive webhook HMAC and security test suite — `TestHMACVerification`, `TestTimestampReplayPrevention` (freezegun), `TestSecretRotation`, `TestDeadLetterBehaviour` (exactly 8 failures, exponential backoff), `TestConcurrency`, `TestSSRFProtection`, and AST static-analysis test for `hmac.compare_digest`.
+- **#144** `docs/webhook_security_model.md`: HMAC signing, replay prevention, secret rotation, dead-letter recovery, and SSRF protection documentation.
 - **#147** Pedersen commitment ZK scheme (`detection/zk_commitment.py`): `PedersenParams`, `PedersenCommitment`, `ThresholdProof` dataclasses; `commit()`, `open()`, `prove_below_threshold()`, `verify_below_threshold()` functions over BN254 for privacy-preserving score attestation.
 - **#147** API endpoints `POST /scores/{wallet}/commit` and `POST /scores/verify-threshold` for ZK threshold proofs.
 - **#150** Full governance proposal engine (`detection/governance.py`): `GovernanceEngine` with `submit_proposal`, `cast_vote`, `tally_proposal`, `close_proposal`, `execute_proposal`, `close_expired`; `SettingsReloader` with compile-time allowlist and atomic `.env` write.

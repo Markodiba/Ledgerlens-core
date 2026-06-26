@@ -12,6 +12,7 @@ otherwise run as separate scripts/modules:
 
 import logging
 import os
+import time
 import tomllib
 from pathlib import Path
 
@@ -446,6 +447,24 @@ def stream(
     flush_interval: float = typer.Option(30.0, "--flush-interval", help="Maximum seconds to wait before flushing a partial batch"),
     checkpoint_interval: int = typer.Option(None, envvar="STREAM_CHECKPOINT_INTERVAL", help="Persist window state every N trades (default from settings)"),
     score_delta: int = typer.Option(None, envvar="STREAM_SCORE_DELTA_THRESHOLD", help="Minimum score change to emit an alert (default from settings)"),
+    queue_depth: int = typer.Option(
+        None,
+        "--queue-depth",
+        min=1,
+        envvar="STREAMER_QUEUE_MAXSIZE",
+        help="Maximum number of buffered Horizon trades (default from settings).",
+    ),
+    overflow_strategy: str = typer.Option(
+        None,
+        "--overflow-strategy",
+        envvar="STREAMER_OVERFLOW_STRATEGY",
+        help="Queue overflow policy: block, drop_newest, or drop_oldest.",
+    ),
+    reset_cursor: bool = typer.Option(
+        False,
+        "--reset-cursor",
+        help="Delete the Horizon cursor checkpoint before streaming.",
+    ),
 ) -> None:
     """Stream trades from Horizon SSE and score incrementally per wallet.
 
@@ -464,11 +483,39 @@ def stream(
     from detection.storage import init_db, save_scores
     from detection.webhook_queue import enqueue
     from detection.webhook_registry import get_matching_subscribers
-    from ingestion.horizon_streamer import stream_trades
+    from ingestion.checkpoint import CursorCheckpoint, FlushPolicy, resolve_checkpoint_path
+    from ingestion.horizon_streamer import stream_trades_with_cursor
     import api.main as api_main
 
     _chk_interval = checkpoint_interval if checkpoint_interval is not None else cfg.stream_checkpoint_interval
     _score_delta = score_delta if score_delta is not None else cfg.stream_score_delta_threshold
+    _queue_depth = queue_depth if queue_depth is not None else cfg.streamer_queue_maxsize
+    _overflow_strategy = (
+        overflow_strategy
+        if overflow_strategy is not None
+        else cfg.streamer_overflow_strategy
+    )
+    if _overflow_strategy not in {"block", "drop_newest", "drop_oldest"}:
+        raise typer.BadParameter(
+            "must be block, drop_newest, or drop_oldest",
+            param_hint="--overflow-strategy",
+        )
+    cursor_checkpoint = CursorCheckpoint(
+        resolve_checkpoint_path(cfg.cursor_checkpoint_path, cfg.data_dir)
+    )
+    if reset_cursor:
+        cursor_checkpoint.delete()
+        logger.info("Reset Horizon cursor checkpoint")
+    stored_cursor = cursor_checkpoint.load()
+    cursor = stored_cursor or cfg.horizon_default_cursor
+    if stored_cursor:
+        logger.info("Resuming from cursor %s", cursor)
+    else:
+        logger.info("Starting fresh from cursor %s", cursor)
+    cursor_flush_policy = FlushPolicy(
+        max_events=cfg.cursor_flush_events,
+        max_seconds=cfg.cursor_flush_seconds,
+    )
 
     init_db()
     checkpoint_store = RollingWindowStore()
@@ -500,14 +547,22 @@ def stream(
     signal.signal(signal.SIGINT, _shutdown)
 
     trades_since_checkpoint = 0
+    cursor_events_since_flush = 0
+    last_cursor_flush = time.monotonic()
+    last_cursor = cursor
 
     logger.info(
-        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d)",
+        "Starting incremental stream (checkpoint_interval=%d, score_delta=%d, "
+        "queue_depth=%d, overflow_strategy=%s)",
         _chk_interval,
         _score_delta,
+        _queue_depth,
+        _overflow_strategy,
     )
 
-    for trade in stream_trades():
+    for trade, event_cursor in stream_trades_with_cursor(
+        cursor=cursor, checkpoint=cursor_checkpoint
+    ):
         if stop_event.is_set():
             break
 
@@ -526,6 +581,16 @@ def stream(
             except Exception as exc:  # pragma: no cover
                 logger.warning("Webhook dispatch error: %s", exc)
 
+        last_cursor = event_cursor
+        cursor_events_since_flush += 1
+        now = time.monotonic()
+        if cursor_flush_policy.should_flush(
+            cursor_events_since_flush, last_cursor_flush, now
+        ):
+            cursor_checkpoint.save(last_cursor)
+            cursor_events_since_flush = 0
+            last_cursor_flush = now
+
         trades_since_checkpoint += 1
         if trades_since_checkpoint >= _chk_interval:
             checkpoint_store.save_all(scorer.window_state)
@@ -534,6 +599,8 @@ def stream(
 
     # Final checkpoint on clean exit
     checkpoint_store.save_all(scorer.window_state)
+    if cursor_events_since_flush:
+        cursor_checkpoint.save(last_cursor)
     logger.info("Stream stopped. Final checkpoint written.")
 
 
