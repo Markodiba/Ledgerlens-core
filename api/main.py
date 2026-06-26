@@ -260,6 +260,7 @@ app.include_router(batch_router)
 
 
 app.include_router(export_router)
+app.include_router(api_keys_router)
 
 
 app.include_router(cross_chain_router)
@@ -746,7 +747,7 @@ def wallet_counterfactual(
     }
 
 
-@v1_router.get("/scores/{wallet}")
+@v1_router.get("/scores/{wallet}", dependencies=[Depends(require_scope("read:scores"))])
 def wallet_scores(wallet: str) -> dict:
     """Return the latest score for `wallet` on each asset pair.
 
