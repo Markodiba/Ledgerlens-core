@@ -1642,7 +1642,13 @@ def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
     Each alert dict must carry ``alert_type``, ``wallet``, ``asset_pair`` and a
     JSON-serialisable ``detail`` mapping; ``pool_id`` and ``timestamp`` (ISO 8601)
     are optional and default to ``None`` / now.
+
+    Suppressed wallets are silently dropped before persistence (Issue #178).
     """
+    if not alerts:
+        return
+    from detection.suppressions import filter_suppressed_alerts
+    alerts = filter_suppressed_alerts(alerts, db_path=db_path)
     if not alerts:
         return
     init_db(db_path)
