@@ -4,11 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       matrix:
         python-version: ["3.10", "3.12"]
@@ -22,7 +22,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt ruff
+        run: pip install --timeout 300 -r requirements.txt ruff
 
       - name: Lint
         run: ruff check .
