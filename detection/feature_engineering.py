@@ -9,12 +9,26 @@ account-metadata inputs are optional and come from
 `ingestion.operations_loader` / `ingestion.account_loader` respectively.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pandas as pd
 
 from detection.amm_engine import pool_round_trip_ratio, pool_share_concentration
-from detection.benford_engine import compute_benford_metrics
+from detection.benford_engine import (
+    AdaptiveBenfordWindow,
+    compute_benford_ks_kuiper,
+    compute_benford_metrics,
+    stratified_benford_analysis,
+)
+from detection.causal_engine import estimate_pdc  # noqa: F401
 from detection.path_payment_engine import detect_atomic_circular_routes
+from detection.sandwich_engine import detect_sandwich_candidates
 from ingestion.data_models import LiquidityPool, PathPayment, TradeType
+
+if TYPE_CHECKING:
+    from detection.cross_chain_linker import CrossChainLinker
 
 ROLLING_WINDOWS = {
     "1h": pd.Timedelta(hours=1),
@@ -31,6 +45,37 @@ BENFORD_FEATURE_NAMES = [
     f"benford_{metric}_{window}"
     for window in ROLLING_WINDOWS
     for metric in ("chi_square", "mad", "max_zscore")
+]
+
+# Boolean flags indicating that the corresponding Benford window was
+# adaptively expanded or merged due to insufficient sample count.
+BENFORD_WINDOW_EXPANDED_FEATURE_NAMES = [
+    f"benford_window_expanded_{window}" for window in ROLLING_WINDOWS
+]
+
+# Per-stratum Benford summary features (3 features x 5 windows = 15 new)
+BENFORD_STRATUM_FEATURE_NAMES = [
+    f"max_stratum_chi2_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"max_stratum_MAD_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"n_flagged_strata_{window}" for window in ROLLING_WINDOWS
+]
+
+# KS and Kuiper test features (4 per window x 5 windows = 20 new)
+BENFORD_KS_KUIPER_FEATURE_NAMES = [
+    f"ks_stat_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"ks_pval_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"kuiper_stat_{window}" for window in ROLLING_WINDOWS
+] + [
+    f"kuiper_pval_{window}" for window in ROLLING_WINDOWS
+]
+
+# Majority-vote combined Benford flag (1 per window x 5 windows = 5 new)
+BENFORD_COMBINED_FLAG_FEATURE_NAMES = [
+    f"benford_combined_flag_{window}" for window in ROLLING_WINDOWS
 ]
 
 TRADE_PATTERN_FEATURE_NAMES = [
@@ -51,6 +96,10 @@ WALLET_GRAPH_FEATURE_NAMES = [
     "funding_source_similarity_score",
     "network_centrality",
     "account_age_days",
+    "wash_ring_membership",
+    "wash_ring_size",
+    "cycle_volume_ratio",
+    "timing_tightness_score",
 ]
 
 CROSS_PAIR_FEATURE_NAMES = [
@@ -65,12 +114,58 @@ AMM_FEATURE_NAMES = [
     "pool_trade_ratio",  # fraction of an account's volume that is pool, not orderbook
     "pool_round_trip_ratio",
     "pool_share_concentration",
+    "amm_tenure_ratio",
+    "amm_volume_concentration",
 ]
 
 PATH_PAYMENT_FEATURE_NAMES = [
     "atomic_self_payment_ratio",  # fraction of an account's path payments where source==destination
     "avg_path_hop_count",
     "path_cycle_volume_ratio",  # fraction of volume in source-asset == destination-asset cycles
+    "path_payment_frequency",   # fraction of all trades that originated from path payments
+]
+
+PATH_PAYMENT_CYCLE_FEATURE_NAMES = [
+    "path_cycle_count_24h",  # closed multi-hop cycles this account is part of in 24h
+    "path_cycle_xlm_volume_24h",  # total XLM value of cyclic path-payment volume in 24h
+    "max_cycle_length",  # longest detected cycle (longer == more sophisticated evasion)
+    "cycle_asset_diversity",  # distinct intermediate assets across this account's cycles
+]
+
+# Hop-graph cycle features from PathCycleDetector (issue #121)
+HOP_CYCLE_FEATURE_NAMES = [
+    "path_cycle_count",           # total confirmed round-trip cycles for this wallet
+    "path_cycle_recovery_ratio",  # max recovery ratio across all cycles
+]
+
+SANDWICH_FEATURE_NAMES = [
+    "sandwich_ratio",  # fraction of an account's pool trades that are attacker legs of a sandwich
+    "sandwich_profit_xlm_30d",  # XLM the account extracted as a sandwich attacker over the last 30d
+]
+
+CROSS_CHAIN_FEATURE_NAMES = [
+    "has_evm_link",
+    "evm_round_trip_frequency",
+    "evm_benford_mad_30d",
+    "evm_counterparty_concentration",
+    "bridge_volume_ratio",
+    "cross_chain_time_lag_median_h",
+    "cross_chain_round_trip_score",
+]
+
+CAUSAL_FEATURE_NAMES = [
+    "pdc_5m",
+    "pdc_1h",
+]
+
+MULTIVARIATE_BENFORD_FEATURE_NAMES = [
+    "benford_copula_pval",
+    "cross_pair_sync_ratio",
+    "digit_entropy_delta",
+]
+
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_prob",
 ]
 
 FEATURE_NAMES = (
@@ -81,6 +176,14 @@ FEATURE_NAMES = (
     + CROSS_PAIR_FEATURE_NAMES
     + AMM_FEATURE_NAMES
     + PATH_PAYMENT_FEATURE_NAMES
+    + GNN_FEATURE_NAMES
+    + SANDWICH_FEATURE_NAMES
+    + CAUSAL_FEATURE_NAMES
+    + MULTIVARIATE_BENFORD_FEATURE_NAMES
+    + BENFORD_WINDOW_EXPANDED_FEATURE_NAMES
+    + BENFORD_STRATUM_FEATURE_NAMES
+    + BENFORD_KS_KUIPER_FEATURE_NAMES
+    + BENFORD_COMBINED_FLAG_FEATURE_NAMES
 )
 
 # Adversarial meta-features are appended after the baseline features so that
@@ -92,6 +195,17 @@ try:
     _HAS_ADVERSARIAL = True
 except ImportError:  # pragma: no cover
     _HAS_ADVERSARIAL = False
+
+# Cross-chain features are appended last so existing model checkpoints remain
+# loadable — old models see 0.0 for these features during inference.
+FEATURE_NAMES = FEATURE_NAMES + CROSS_CHAIN_FEATURE_NAMES  # type: ignore[assignment]
+
+# Multivariate-Benford and causal (PDC) features are appended after
+# cross-chain features for the same checkpoint-compatibility reason.
+FEATURE_NAMES = FEATURE_NAMES + MULTIVARIATE_BENFORD_FEATURE_NAMES + CAUSAL_FEATURE_NAMES  # type: ignore[assignment]
+
+# Hop-graph cycle features (issue #121) appended for checkpoint compatibility.
+FEATURE_NAMES = FEATURE_NAMES + HOP_CYCLE_FEATURE_NAMES  # type: ignore[assignment]
 
 
 def _window_slice(trades: pd.DataFrame, as_of: pd.Timestamp, window: pd.Timedelta) -> pd.DataFrame:
@@ -117,16 +231,62 @@ def _asset_symbol(asset: dict) -> str:
     return code if issuer is None else f"{code}:{issuer}"
 
 
-def benford_features(trades: pd.DataFrame, as_of: pd.Timestamp) -> dict:
-    """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window."""
+def benford_features(
+    trades: pd.DataFrame,
+    as_of: pd.Timestamp,
+    adaptive_window: AdaptiveBenfordWindow | None = None,
+) -> dict:
+    """Chi-square, MAD, and max Z-score for `base_amount` across each rolling window.
+
+    Also computes per-stratum Benford summary features (max chi-square, max MAD,
+    and flagged strata count) for each window via ``stratified_benford_analysis``.
+
+    When ``adaptive_window`` is provided the window is expanded (or merged) as
+    needed to reach the configured minimum sample count, and a boolean
+    ``benford_window_expanded_{label}`` flag is set for each window that was
+    widened beyond the nominal target.
+    """
     features = {}
     for label, window in ROLLING_WINDOWS.items():
-        subset = _window_slice(trades, as_of, window)
-        metrics = compute_benford_metrics(subset["base_amount"].tolist())
+        if adaptive_window is not None:
+            result = adaptive_window.fit(trades, label, as_of, ROLLING_WINDOWS)
+            amounts = result.trades
+            features[f"benford_window_expanded_{label}"] = float(result.expanded or result.merged)
+            subset = _window_slice(trades, as_of, window)
+        else:
+            subset = _window_slice(trades, as_of, window)
+            amounts = subset["base_amount"].tolist()
+            features[f"benford_window_expanded_{label}"] = 0.0
+        metrics = compute_benford_metrics(amounts)
         features[f"benford_chi_square_{label}"] = metrics["chi_square"]
         features[f"benford_mad_{label}"] = metrics["mad"]
         features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
+
+        summary = stratified_benford_analysis(subset)
+        features[f"max_stratum_chi2_{label}"] = summary.max_stratum_chi2
+        features[f"max_stratum_MAD_{label}"] = summary.max_stratum_MAD
+        features[f"n_flagged_strata_{label}"] = float(summary.n_flagged_strata)
+
+        ks_kuiper = compute_benford_ks_kuiper(amounts)
+        features[f"ks_stat_{label}"] = ks_kuiper["ks_stat"] if not _is_nan(ks_kuiper["ks_stat"]) else 0.0
+        features[f"ks_pval_{label}"] = ks_kuiper["ks_pval"] if not _is_nan(ks_kuiper["ks_pval"]) else 1.0
+        features[f"kuiper_stat_{label}"] = ks_kuiper["kuiper_stat"] if not _is_nan(ks_kuiper["kuiper_stat"]) else 0.0
+        features[f"kuiper_pval_{label}"] = ks_kuiper["kuiper_pval"] if not _is_nan(ks_kuiper["kuiper_pval"]) else 1.0
+
+        chi2_flag = metrics["chi_square"] > 15.507
+        ks_flag = ks_kuiper.get("ks_flag", False)
+        kuiper_flag = ks_kuiper.get("kuiper_flag", False)
+        n_flags = sum([chi2_flag, ks_flag, kuiper_flag])
+        features[f"benford_combined_flag_{label}"] = 1.0 if n_flags >= 2 else 0.0
     return features
+
+
+def _is_nan(value: float) -> bool:
+    import math
+    try:
+        return math.isnan(value)
+    except (TypeError, ValueError):
+        return False
 
 
 def counterparty_concentration_ratio(trades: pd.DataFrame, account: str) -> float:
@@ -293,6 +453,29 @@ def account_age_days(account: str, as_of: pd.Timestamp, account_metadata: dict[s
     return float((as_of - pd.Timestamp(created_at)).total_seconds() / 86400)
 
 
+def graph_ring_features(account: str, ring_membership: dict[str, dict] | None) -> dict:
+    """Compute graph-structural wash-ring features for `account`."""
+    zero = {
+        "wash_ring_membership": 0.0,
+        "wash_ring_size": 0.0,
+        "cycle_volume_ratio": 0.0,
+        "timing_tightness_score": 0.0,
+    }
+    if not ring_membership:
+        return zero
+
+    metadata = ring_membership.get(account)
+    if metadata is None:
+        return zero
+
+    return {
+        "wash_ring_membership": 1.0,
+        "wash_ring_size": float(metadata.get("wash_ring_size", metadata.get("ring_size", 0.0))),
+        "cycle_volume_ratio": float(metadata.get("cycle_volume_ratio", 0.0)),
+        "timing_tightness_score": float(metadata.get("timing_tightness_score", 0.0)),
+    }
+
+
 def cross_pair_features(
     account: str,
     trades_by_pair: dict[str, pd.DataFrame] | None,
@@ -384,15 +567,18 @@ def amm_features(
     account: str,
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
+    amm_engine: "AMMEngine | None" = None,
 ) -> dict:
-    """Compute the three AMM pool features for `account`.
+    """Compute the AMM pool features for `account`.
 
     `pool_trade_ratio` and `pool_round_trip_ratio` are derived from `trades`
     alone (rows with `trade_type == LIQUIDITY_POOL`). `pool_share_concentration`
     additionally needs `liquidity_pools` (id -> `LiquidityPool`) and
     `pool_deposits` (id -> deposit/withdraw DataFrame); omitting either yields
-    `0.0` for that feature.
+    `0.0` for that feature. `amm_tenure_ratio` and `amm_volume_concentration`
+    come from the AMMEngine session tracker when available.
     """
+    from detection.amm_engine import AMMEngine as _AMMEngine
     zero = {name: 0.0 for name in AMM_FEATURE_NAMES}
     if trades.empty or "trade_type" not in trades.columns:
         return zero
@@ -421,16 +607,28 @@ def amm_features(
                 concentrations.append(pool_share_concentration(pool, deposits))
     avg_concentration = float(sum(concentrations) / len(concentrations)) if concentrations else 0.0
 
+    amm_feats = {"amm_tenure_ratio": 0.0, "amm_volume_concentration": 0.0}
+    if amm_engine is not None:
+        amm_feats = amm_engine.get_features(account)
+
     return {
         "pool_trade_ratio": pool_trade_ratio,
         "pool_round_trip_ratio": avg_round_trip,
         "pool_share_concentration": avg_concentration,
+        "amm_tenure_ratio": amm_feats.get("amm_tenure_ratio", 0.0),
+        "amm_volume_concentration": amm_feats.get("amm_volume_concentration", 0.0),
     }
 
 
-def path_payment_features(path_payments: list[PathPayment] | None, account: str) -> dict:
-    """Compute the three path-payment features for `account`'s own payments
+def path_payment_features(path_payments: list[PathPayment] | None, account: str, trades: "pd.DataFrame | None" = None) -> dict:
+    """Compute the path-payment features for `account`'s own payments
     (`source_account == account`). Omitting `path_payments` yields `0.0`.
+
+    Args:
+        path_payments: List of PathPayment records for the account.
+        account: The wallet address being scored.
+        trades: Optional DataFrame of all trades for the account, used to
+            compute ``path_payment_frequency`` (fraction of trades from path payments).
     """
     zero = {name: 0.0 for name in PATH_PAYMENT_FEATURE_NAMES}
     if not path_payments:
@@ -447,14 +645,195 @@ def path_payment_features(path_payments: list[PathPayment] | None, account: str)
     total_volume = sum(p.source_amount for p in own_payments)
     hop_counts = [len(p.path) + 1 for p in own_payments]
 
+    # path_payment_frequency: fraction of all trades that came from path payments
+    pp_frequency = 0.0
+    if trades is not None and len(trades) > 0:
+        pp_col = "path_payment_id"
+        if pp_col in trades.columns:
+            pp_count = trades[pp_col].notna().sum()
+            pp_frequency = float(pp_count / len(trades))
+
     return {
         "atomic_self_payment_ratio": float(self_payment_count / len(own_payments)),
         "avg_path_hop_count": float(sum(hop_counts) / len(hop_counts)),
         "path_cycle_volume_ratio": float(cycle_volume / total_volume) if total_volume > 0 else 0.0,
+        "path_payment_frequency": pp_frequency,
     }
 
 
-def build_feature_vector(
+def path_payment_cycle_features(
+    path_payments: list[PathPayment] | None,
+    path_cycles: list[dict] | None,
+    account: str,
+) -> dict:
+    """Compute the four multi-hop path-payment cycle features for `account`.
+
+    `path_cycles` is the batch-level output of
+    `detection.path_cycle_detector.detect_path_payment_cycles`. When it is not
+    supplied but `path_payments` are, the cycle search is run on demand; passing
+    precomputed cycles avoids re-running Johnson's algorithm per account.
+    """
+    from detection.path_cycle_detector import detect_cycles_from_payments, path_cycle_features
+
+    zero = {name: 0.0 for name in PATH_PAYMENT_CYCLE_FEATURE_NAMES}
+    if path_cycles is None:
+        if not path_payments:
+            return zero
+        path_cycles = detect_cycles_from_payments(path_payments)
+
+    return path_cycle_features(path_cycles, account)
+
+
+def sandwich_features(
+    trades: pd.DataFrame,
+    account: str,
+    as_of: pd.Timestamp,
+    min_profit_xlm: float = 10.0,
+) -> dict:
+    """Compute wallet-level sandwich-aggressor features for `account`.
+
+    `sandwich_ratio` is the share of `account`'s pool trades that are attacker
+    legs (buy + sell) of a detected sandwich. `sandwich_profit_xlm_30d` is the
+    XLM profit `account` extracted as the attacker across sandwiches whose
+    opening buy falls in the 30 days ending at `as_of`.
+    """
+    zero = {name: 0.0 for name in SANDWICH_FEATURE_NAMES}
+    if trades.empty or "trade_type" not in trades.columns or "price" not in trades.columns:
+        return zero
+
+    pool_trades = trades.loc[trades["trade_type"] == TradeType.LIQUIDITY_POOL]
+    if pool_trades.empty:
+        return zero
+
+    window = _window_slice(pool_trades, as_of, ROLLING_WINDOWS["30d"])
+    if window.empty:
+        return zero
+
+    candidates = detect_sandwich_candidates(window, min_profit_xlm=min_profit_xlm)
+    own = [c for c in candidates if c.attacker == account]
+    if not own:
+        return zero
+
+    account_pool_trades = pool_trades[pool_trades["base_account"] == account]
+    denom = len(account_pool_trades)
+    # each sandwich contributes two attacker legs (buy + sell)
+    ratio = min(2 * len(own) / denom, 1.0) if denom > 0 else 0.0
+    profit = sum(c.profit_xlm for c in own)
+
+    return {
+        "sandwich_ratio": float(ratio),
+        "sandwich_profit_xlm_30d": float(profit),
+    }
+
+
+def compute_cross_chain_link_confidence(wallet: str, linker: "CrossChainLinker") -> float:
+    """Returns max confidence across all accepted cross-chain links for this wallet.
+
+    Returns 0.0 if no accepted links exist.
+    """
+    links = linker.get_accepted_links(wallet)
+    if not links:
+        return 0.0
+    return max(h.confidence for h in links)
+
+
+def build_cross_chain_features(
+    wallet: str,
+    linker: "CrossChainLinker",  # noqa: F821
+    sdex_volume: float = 0.0,
+    evm_trades: list[dict] | None = None,
+) -> dict:
+    """Compute the six cross-chain features for ``wallet``.
+
+    ``linker`` is a :class:`detection.cross_chain_linker.CrossChainLinker`
+    instance.  ``sdex_volume`` is the total SDEX trade volume for the wallet
+    (used to compute ``bridge_volume_ratio``).  ``evm_trades`` is an optional
+    list of EVM trade dicts (same schema as ``CrossChainTrade.model_dump()``).
+    """
+    zero: dict = {name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES}
+
+    evm_wallets = linker.link_wallets(wallet)
+    if not evm_wallets:
+        return zero
+
+    pattern = linker.get_evm_trade_pattern(
+        evm_wallets, chain="ethereum", evm_trades=evm_trades or []
+    )
+
+    evm_volume = pattern.get("total_evm_volume", 0.0)
+    bridge_volume_ratio = evm_volume / sdex_volume if sdex_volume > 0 else 0.0
+
+    unique_cp = pattern.get("unique_counterparties", 0)
+    if unique_cp > 0 and evm_trades:
+        wallet_trades = [
+            t for t in (evm_trades or []) if t.get("wallet_address") in set(evm_wallets)
+        ]
+        from collections import Counter
+        cp_counts = Counter(t.get("counterparty", "") for t in wallet_trades if t.get("counterparty"))
+        total = sum(cp_counts.values())
+        hhi = sum((c / total) ** 2 for c in cp_counts.values()) if total > 0 else 0.0
+    else:
+        hhi = 0.0
+
+    # Compute cross-chain round-trip score from bridge transfers
+    from detection.cross_chain_correlator import CrossChainCorrelator
+    from detection.storage import get_bridge_transfers
+    transfers = get_bridge_transfers(stellar_wallet=wallet, since_days=90)
+    correlator = CrossChainCorrelator()
+    round_trip_score = correlator.compute_round_trip_score(wallet, transfers)
+
+    return {
+        "has_evm_link": 1.0,
+        "evm_round_trip_frequency": float(pattern.get("round_trip_frequency", 0.0)),
+        "evm_benford_mad_30d": float(pattern.get("benford_mad", 0.0)),
+        "evm_counterparty_concentration": float(hhi),
+        "bridge_volume_ratio": float(bridge_volume_ratio),
+        "cross_chain_time_lag_median_h": 0.0,
+        "cross_chain_round_trip_score": round_trip_score,
+    }
+
+
+def multivariate_benford_features(account: str, trades_by_pair: dict[str, pd.DataFrame] | None) -> dict:
+    """Cross-pair Benford coordination features for `account`.
+
+    `trades_by_pair` maps asset-pair label -> trades DataFrame (each row must
+    carry an `asset_pair` column; see
+    `detection.benford_engine.multivariate_benford_score`). Omitting it (or
+    passing fewer than 2 pairs) yields the i.i.d.-Benford defaults.
+    """
+    zero = {name: (1.0 if name == "benford_copula_pval" else 0.0) for name in MULTIVARIATE_BENFORD_FEATURE_NAMES}
+    if not trades_by_pair or len(trades_by_pair) < 2:
+        return zero
+
+    from detection.benford_engine import multivariate_benford_score
+
+    wallet_pairs = [(account, pair) for pair in trades_by_pair]
+    combined = pd.concat(trades_by_pair.values(), ignore_index=True)
+    result = multivariate_benford_score(combined, wallet_pairs)
+    return {
+        "benford_copula_pval": result["copula_pval"],
+        "cross_pair_sync_ratio": result["sync_ratio"],
+        "digit_entropy_delta": result["digit_entropy_delta"],
+    }
+
+
+def causal_features(
+    trades: pd.DataFrame, account: str, prices: pd.DataFrame | None, pair: str | None
+) -> dict:
+    """Price-discovery-contribution (PDC) features for `account` on `pair`.
+
+    `prices` is a `timestamp` + `mid_price`/`price` series for `pair`;
+    omitting it (or `pair`) yields `0.0` for both windows.
+    """
+    if prices is None or pair is None:
+        return {name: 0.0 for name in CAUSAL_FEATURE_NAMES}
+    return {
+        "pdc_5m": estimate_pdc(trades, prices, account, pair, window_minutes=5),
+        "pdc_1h": estimate_pdc(trades, prices, account, pair, window_minutes=60),
+    }
+
+
+def _build_feature_vector_base(
     trades: pd.DataFrame,
     account: str,
     as_of: pd.Timestamp,
@@ -466,6 +845,14 @@ def build_feature_vector(
     liquidity_pools: dict[str, LiquidityPool] | None = None,
     pool_deposits: dict[str, pd.DataFrame] | None = None,
     path_payments: list[PathPayment] | None = None,
+    pool_events: list | None = None,
+    gnn_scores: dict[str, float] | None = None,
+    path_cycles: list[dict] | None = None,
+    ring_membership: dict[str, dict] | None = None,
+    prices: pd.DataFrame | None = None,
+    pair: str | None = None,
+    cross_chain_linker: "CrossChainLinker | None" = None,  # noqa: F821
+    adaptive_benford_window: AdaptiveBenfordWindow | None = None,
 ) -> dict:
     """Assemble the full feature vector for `account` as of `as_of`.
 
@@ -485,11 +872,17 @@ def build_feature_vector(
     `liquidity_pools`, `pool_deposits`, and `path_payments` are optional;
     omitting them yields `0.0` for the AMM/path-payment features that depend
     on them.
+
+    `gnn_scores` is a wallet->probability mapping from `GNNInferenceEngine.score_graph`;
+    omitting it yields `0.0` for `gnn_wash_ring_prob`.
+    `prices` (a `timestamp` + `mid_price`/`price` series for the pair) and
+    `pair` drive the causal PDC features; omitting `prices` yields `0.0` for
+    `pdc_5m`/`pdc_1h`.
     """
     order_book_events = order_book_events if order_book_events is not None else pd.DataFrame(columns=["account", "event_type"])
     account_metadata = account_metadata or {}
 
-    features = benford_features(trades, as_of)
+    features = benford_features(trades, as_of, adaptive_window=adaptive_benford_window)
     features.update(
         {
             "counterparty_concentration_ratio": counterparty_concentration_ratio(trades, account),
@@ -505,9 +898,171 @@ def build_feature_vector(
             "account_age_days": account_age_days(account, as_of, account_metadata),
         }
     )
+    features.update(graph_ring_features(account, ring_membership))
     features.update(cross_pair_features(account, trades_by_pair, correlated_pairs, cross_pair_wallets))
-    features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
+    features.update(amm_features(trades, account, liquidity_pools, pool_deposits, pool_events))
     features.update(path_payment_features(path_payments, account))
+    features["gnn_wash_ring_prob"] = float((gnn_scores or {}).get(account, 0.0))
+    features.update(amm_features(trades, account, liquidity_pools, pool_deposits))
+    features.update(path_payment_features(path_payments, account, trades))
+    features.update(path_payment_cycle_features(path_payments, path_cycles, account))
+    features.update(causal_features(trades, account, prices, pair))
+    features.update(multivariate_benford_features(account, trades_by_pair))
+    features.update(sandwich_features(trades, account, as_of))
     if _HAS_ADVERSARIAL:
         features.update(_compute_adv(trades, account))
+
+    if cross_chain_linker is not None:
+        sdex_volume = float(_account_trades(trades, account)["base_amount"].sum()) if not trades.empty else 0.0
+        features.update(build_cross_chain_features(account, cross_chain_linker, sdex_volume=sdex_volume))
+    else:
+        features.update({name: 0.0 for name in CROSS_CHAIN_FEATURE_NAMES})
+
+    features.update(multivariate_benford_features(account, trades_by_pair))
+    features.update(causal_features(trades, account, prices, pair))
+
     return features
+
+
+# --- T-GNN features (appended after PATH_PAYMENT_FEATURE_NAMES so existing
+# model checkpoints trained without these stay loadable by index/order). ---
+GNN_FEATURE_NAMES = [
+    "gnn_wash_ring_probability",
+    "gnn_neighbor_avg_score",
+]
+
+# Path-payment cycle features are appended after GNN features so that existing
+# model checkpoints stay loadable (old models default these to 0.0 at inference).
+FEATURE_NAMES = FEATURE_NAMES + GNN_FEATURE_NAMES + PATH_PAYMENT_CYCLE_FEATURE_NAMES
+
+
+def build_feature_vector(*args, use_gnn: bool = False, gnn_features: dict = None, **kwargs):
+    """Wraps the base feature vector builder, optionally appending GNN features.
+
+    Args:
+        use_gnn: If True, appends gnn_wash_ring_probability and
+            gnn_neighbor_avg_score (default 0.0 if not found in gnn_features).
+        gnn_features: Optional {wallet: {feature_name: value}} lookup.
+        adaptive_benford_window: Optional AdaptiveBenfordWindow instance. When
+            provided, Benford windows are expanded as needed to meet the
+            minimum sample count; ``benford_window_expanded_{label}`` flags are
+            set accordingly.
+    """
+    vector = _build_feature_vector_base(*args, **kwargs)
+    if use_gnn:
+        wallet = kwargs.get("wallet") or (args[0] if args else None)
+        feats = (gnn_features or {}).get(wallet, {})
+        vector = list(vector) + [
+            float(feats.get("gnn_wash_ring_probability", 0.0)),
+            float(feats.get("gnn_neighbor_avg_score", 0.0)),
+        ]
+    return vector
+
+
+class FeatureEngineering:
+    """Thin wrapper around the module-level feature functions.
+
+    Provides :meth:`compute_incremental` for the streaming path, which takes
+    per-wallet rolling-window trade lists (already scoped to 1h/4h/24h) and
+    builds the full feature vector without requiring a global DataFrame.
+    """
+
+    def compute_incremental(
+        self,
+        wallet: str,
+        trades_1h: list,
+        trades_4h: list,
+        trades_24h: list,
+    ) -> dict:
+        """Compute all features from rolling-window trade lists for *wallet*.
+
+        Benford features are computed over each window independently.
+        Graph and cross-pair features use 24-h trades only.
+        Returns a ``{feature_name: float}`` dict keyed to :data:`FEATURE_NAMES`.
+        """
+        import pandas as pd
+
+        def _to_df(trades: list) -> pd.DataFrame:
+            if not trades:
+                return pd.DataFrame()
+            rows = [t.model_dump() for t in trades]
+            df = pd.DataFrame(rows)
+            df["ledger_close_time"] = pd.to_datetime(df["ledger_close_time"], utc=True)
+            # Flatten nested asset dicts
+            if "base_asset" in df.columns and isinstance(df["base_asset"].iloc[0], dict):
+                df["base_asset"] = df["base_asset"].apply(lambda d: d)  # keep as dict for _asset_symbol
+            return df
+
+        df_1h = _to_df(trades_1h)
+        df_4h = _to_df(trades_4h)
+        df_24h = _to_df(trades_24h)
+        as_of = pd.Timestamp.now(tz="UTC")
+
+        features: dict = {}
+
+        # Benford features per window
+        for label, df in [("1h", df_1h), ("4h", df_4h), ("24h", df_24h)]:
+            if df.empty:
+                for metric in ("chi_square", "mad", "max_zscore"):
+                    features[f"benford_{metric}_{label}"] = 0.0
+            else:
+                from detection.benford_engine import compute_benford_metrics
+                metrics = compute_benford_metrics(df["base_amount"].tolist())
+                features[f"benford_chi_square_{label}"] = metrics["chi_square"]
+                features[f"benford_mad_{label}"] = metrics["mad"]
+                features[f"benford_max_zscore_{label}"] = max(metrics["z_scores"].values(), default=0.0)
+
+        # Remaining windows (7d, 30d) fallback to 0 — no data available in streaming
+        for label in ("7d", "30d"):
+            for metric in ("chi_square", "mad", "max_zscore"):
+                features[f"benford_{metric}_{label}"] = 0.0
+
+        # Trade-pattern and volume/timing features (use 24h window)
+        if not df_24h.empty:
+            features["counterparty_concentration_ratio"] = counterparty_concentration_ratio(df_24h, wallet)
+            features["round_trip_trade_frequency"] = round_trip_trade_frequency(df_24h, wallet)
+            features["self_matching_rate"] = self_matching_rate(df_24h)
+            features["order_cancellation_rate"] = 0.0
+            features["volume_to_unique_counterparty_ratio"] = volume_to_unique_counterparty_ratio(df_24h, wallet)
+            features["intra_minute_clustering_coefficient"] = intra_minute_clustering_coefficient(df_24h)
+            features["off_hours_activity_ratio"] = off_hours_activity_ratio(df_24h)
+            features["volume_spike_frequency"] = volume_spike_frequency(df_24h, as_of)
+        else:
+            for name in TRADE_PATTERN_FEATURE_NAMES + VOLUME_TIMING_FEATURE_NAMES:
+                features[name] = 0.0
+
+        # Graph/wallet features: no metadata available in streaming path
+        features["funding_source_similarity_score"] = 0.0
+        features["network_centrality"] = 0.0
+        features["account_age_days"] = 0.0
+        features.update(graph_ring_features(wallet, None))
+
+        # Cross-pair, AMM, path-payment, sandwich — not available incrementally
+        for name in CROSS_PAIR_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in AMM_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in PATH_PAYMENT_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in PATH_PAYMENT_CYCLE_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in SANDWICH_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in CAUSAL_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in MULTIVARIATE_BENFORD_FEATURE_NAMES:
+            features[name] = 1.0 if name == "benford_copula_pval" else 0.0
+        if _HAS_ADVERSARIAL:
+            from detection.adversarial_features import ADVERSARIAL_FEATURE_NAMES
+            for name in ADVERSARIAL_FEATURE_NAMES:
+                features[name] = 0.0
+        for name in CROSS_CHAIN_FEATURE_NAMES:
+            features[name] = 0.0
+        for name in GNN_FEATURE_NAMES:
+            features[name] = 0.0
+
+        # Ensure every expected feature key is present
+        for name in FEATURE_NAMES:
+            features.setdefault(name, 0.0)
+
+        return features

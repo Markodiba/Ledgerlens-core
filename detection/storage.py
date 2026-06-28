@@ -15,15 +15,33 @@ integration point is wired up (see README's "Open Integration Points"),
 """
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from enum import Enum
 
 import pandas as pd
 
 from config.settings import settings
 from detection.risk_score import RiskScore
-from ingestion.data_models import PathPayment
+from ingestion.data_models import BridgeTransfer, PathPayment, Trade
+
+logger = logging.getLogger("ledgerlens.storage")
+
+
+class AlertType(str, Enum):
+    """Taxonomy of manipulation alerts surfaced via the `/alerts` API.
+
+    Add new alert categories here; the value is the string stored in the
+    `alerts.alert_type` column and accepted by the `/alerts?alert_type=` query.
+    """
+
+    WASH_TRADING = "WASH_TRADING"
+    CIRCULAR_ROUTE = "CIRCULAR_ROUTE"
+    POOL_MANIPULATION = "POOL_MANIPULATION"
+    SANDWICH_ATTACK = "SANDWICH_ATTACK"
+    PATH_PAYMENT_CYCLE = "PATH_PAYMENT_CYCLE"
 
 
 class SchemaMigrationError(RuntimeError):
@@ -180,7 +198,211 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_retrain_runs_model_name ON retrain_runs (model_name);
         """,
     ),
+    (
+        6,
+        "add robustness_reports table for adversarial evaluation",
+        """
+        CREATE TABLE IF NOT EXISTS robustness_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            asr_json TEXT NOT NULL,
+            mean_map REAL NOT NULL,
+            p95_map REAL NOT NULL,
+            certified_radius REAL NOT NULL,
+            n_samples INTEGER NOT NULL,
+            epsilon REAL NOT NULL,
+            report_json TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_robustness_reports_created_at ON robustness_reports (created_at);
+        """,
+    ),
+    (
+        7,
+        "add dispute, committee, overrides, runtime_config and governance tables",
+        """
+        CREATE TABLE IF NOT EXISTS committee_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            public_key_hex TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            added_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_committee_key_hash ON committee_members (key_hash);
+
+        CREATE TABLE IF NOT EXISTS score_disputes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dispute_id TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            disputed_score INTEGER NOT NULL,
+            soroban_tx_hash TEXT NOT NULL,
+            evidence_url TEXT,
+            submitted_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            committee_votes_json TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_score_disputes_dispute_id ON score_disputes (dispute_id);
+        CREATE INDEX IF NOT EXISTS idx_score_disputes_wallet ON score_disputes (wallet);
+
+        CREATE TABLE IF NOT EXISTS score_overrides (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            dispute_id TEXT NOT NULL,
+            tx_hash TEXT,
+            status TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_score_overrides_dispute_id ON score_overrides (dispute_id);
+
+        CREATE TABLE IF NOT EXISTS runtime_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS governance_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposal_id TEXT NOT NULL,
+            proposal_type TEXT NOT NULL,
+            proposed_value TEXT NOT NULL,
+            proposed_by_key_hash TEXT NOT NULL,
+            votes_for_json TEXT NOT NULL,
+            votes_against_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_governance_proposals_proposal_id ON governance_proposals (proposal_id);
+        """,
+    ),
+    (
+        8,
+        "add wallet_feature_states table for streaming feature store",
+        """
+        CREATE TABLE IF NOT EXISTS wallet_feature_states (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            last_updated TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_feature_states_key ON wallet_feature_states (wallet, asset_pair);
+        CREATE INDEX IF NOT EXISTS idx_wallet_feature_states_updated ON wallet_feature_states (last_updated);
+        """,
+    ),
+    (
+        9,
+        "add wash_rings table for wash trading ring detection",
+        """
+        CREATE TABLE IF NOT EXISTS wash_rings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            accounts_json TEXT NOT NULL,
+            total_volume REAL NOT NULL,
+            cycle_volume REAL NOT NULL,
+            avg_trade_count REAL NOT NULL,
+            timing_tightness REAL NOT NULL,
+            truncated INTEGER NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wash_rings_detected_at ON wash_rings (detected_at);
+        """,
+    ),
+    (
+        10,
+        "add bridge_transfers table for cross-chain wallet linking",
+        """
+        CREATE TABLE IF NOT EXISTS bridge_transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            evm_wallet TEXT NOT NULL,
+            stellar_wallet TEXT NOT NULL,
+            amount_usd REAL,
+            token TEXT NOT NULL,
+            tx_hash_evm TEXT NOT NULL,
+            tx_hash_stellar TEXT,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_bridge_transfers_stellar_wallet
+            ON bridge_transfers (stellar_wallet);
+        CREATE INDEX IF NOT EXISTS idx_bridge_transfers_evm_wallet
+            ON bridge_transfers (evm_wallet);
+        CREATE INDEX IF NOT EXISTS idx_bridge_transfers_timestamp
+            ON bridge_transfers (timestamp);
+        """,
+    ),
+    (
+        11,
+        "add alerts table for typed manipulation alerts",
+        """
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_type TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            asset_pair TEXT NOT NULL,
+            pool_id TEXT,
+            detail_json TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_alerts_wallet ON alerts (wallet);
+        CREATE INDEX IF NOT EXISTS idx_alerts_alert_type ON alerts (alert_type);
+        CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp);
+        """,
+    ),
+    (
+        12,
+        "add path_payment_cycles table for multi-hop cycle detection",
+        """
+        CREATE TABLE IF NOT EXISTS path_payment_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            accounts_json TEXT NOT NULL,
+            cycle_path_json TEXT NOT NULL,
+            cycle_value_xlm REAL NOT NULL,
+            cycle_length INTEGER NOT NULL,
+            completed_in_seconds REAL NOT NULL,
+            asset_diversity INTEGER NOT NULL,
+            cycle_metadata_json TEXT NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_path_payment_cycles_detected_at
+            ON path_payment_cycles (detected_at);
+        """,
+    ),
+    (
+        13,
+        "add integrity verification columns to bridge_transfers",
+        """
+        ALTER TABLE bridge_transfers ADD COLUMN canonical_hash TEXT;
+        ALTER TABLE bridge_transfers ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'disabled';
+        ALTER TABLE bridge_transfers ADD COLUMN verified_at TIMESTAMP;
+        """,
+    ),
+    (
+        14,
+        "add soroban_dead_letters table for DLQ",
+        """
+        CREATE TABLE IF NOT EXISTS soroban_dead_letters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet          TEXT NOT NULL,
+            asset_pair      TEXT NOT NULL,
+            score           INTEGER NOT NULL,
+            ledger_timestamp INTEGER NOT NULL,
+            error_message   TEXT,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending', 'replayed', 'failed')),
+            created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            replayed_at     TIMESTAMP,
+            replay_tx_hash  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_dlq_status ON soroban_dead_letters(status);
+        CREATE INDEX IF NOT EXISTS idx_dlq_created ON soroban_dead_letters(created_at);
+        """,
+    ),
 ]
+
 
 
 @contextmanager
@@ -307,6 +529,66 @@ def init_db(db_path: str | None = None) -> None:
     """Initialise or upgrade the database schema via the migration system."""
     with _connect(db_path) as conn:
         migrate_db(conn)
+
+
+class RiskScoreStore:
+    """SQLite store used by scoring and historical trade ingestion.
+
+    Historical trades are inserted in page-sized batches with
+    ``INSERT OR IGNORE`` so replayed pages and adjacent boundary duplicates
+    are harmless.
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = db_path or settings.db_path
+        init_db(self.db_path)
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+    def upsert_trades(self, trades: list[Trade]) -> int:
+        """Insert validated trades, ignoring existing paging tokens."""
+        if not trades:
+            return 0
+        rows = [
+            (
+                trade.paging_token or trade.id,
+                trade.id,
+                trade.ledger_close_time.isoformat(),
+                trade.base_account,
+                trade.counter_account,
+                trade.base_asset.code,
+                trade.base_asset.issuer,
+                trade.counter_asset.code,
+                trade.counter_asset.issuer,
+                trade.base_amount,
+                trade.counter_amount,
+                trade.price,
+                int(trade.base_is_seller),
+                trade.trade_type.value,
+                trade.liquidity_pool_id,
+                trade.transaction_hash,
+                trade.path_payment_id,
+                trade.hop_index,
+            )
+            for trade in trades
+        ]
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO trades (
+                    paging_token, trade_id, ledger_close_time, base_account,
+                    counter_account, base_asset_code, base_asset_issuer,
+                    counter_asset_code, counter_asset_issuer, base_amount,
+                    counter_amount, price, base_is_seller, trade_type,
+                    liquidity_pool_id, transaction_hash, path_payment_id, hop_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
 
 
 def save_scores(scores: list[RiskScore], db_path: str | None = None) -> None:
@@ -761,6 +1043,43 @@ def get_retrain_runs(
     return [_row_to_retrain_run(row) for row in rows]
 
 
+def save_robustness_report(report: dict, db_path: str | None = None) -> None:
+    """Persist a robustness report dict to the robustness_reports table."""
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO robustness_reports
+                (created_at, model_version, asr_json, mean_map, p95_map, certified_radius, n_samples, epsilon, report_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                report.get("model_version", ""),
+                json.dumps(report.get("asr", {})),
+                float(report.get("mean_map", 0.0)),
+                float(report.get("p95_map", 0.0)),
+                float(report.get("certified_radius", 0.0)),
+                int(report.get("n_samples", 0)),
+                float(report.get("epsilon", 0.0)),
+                json.dumps(report),
+            ),
+        )
+        conn.commit()
+
+
+def get_latest_robustness_report(db_path: str | None = None) -> dict | None:
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT report_json FROM robustness_reports ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0])
+
+
 def _asset_pair_symbol(asset: dict) -> str:
     code = asset["code"]
     issuer = asset.get("issuer")
@@ -930,6 +1249,676 @@ def get_circular_routes(
             "timestamp": row[6],
         }
         for row in rows
+    ]
+
+
+def save_path_payment_cycles(cycles: list[dict], db_path: str | None = None) -> None:
+    """Persist `detect_path_payment_cycles` output from the latest pipeline run.
+
+    The full cycle dict is stored in `cycle_metadata_json` so consumers can
+    recover the originating account, transaction hashes and asset hops; the
+    scalar columns mirror the alert detail for cheap filtering/aggregation.
+    """
+    if not cycles:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO path_payment_cycles
+                (accounts_json, cycle_path_json, cycle_value_xlm, cycle_length,
+                 completed_in_seconds, asset_diversity, cycle_metadata_json, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    json.dumps(c.get("accounts", [])),
+                    json.dumps(c.get("cycle_path", [])),
+                    float(c.get("cycle_value_xlm", 0.0)),
+                    int(c.get("cycle_length", 0)),
+                    float(c.get("completed_in_seconds", 0.0)),
+                    int(c.get("asset_diversity", 0)),
+                    json.dumps(c),
+                    ts,
+                )
+                for c in cycles
+            ],
+        )
+        conn.commit()
+
+
+def get_path_payment_cycles(
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return detected multi-hop path-payment cycles, most recent first."""
+    init_db(db_path)
+    query = (
+        "SELECT accounts_json, cycle_path_json, cycle_value_xlm, cycle_length, "
+        "completed_in_seconds, asset_diversity, cycle_metadata_json, detected_at "
+        "FROM path_payment_cycles ORDER BY detected_at DESC, id DESC"
+    )
+    params: list = []
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "accounts": json.loads(row[0]),
+            "cycle_path": json.loads(row[1]),
+            "cycle_value_xlm": row[2],
+            "cycle_length": row[3],
+            "completed_in_seconds": row[4],
+            "asset_diversity": row[5],
+            "metadata": json.loads(row[6]),
+            "detected_at": row[7],
+        }
+        for row in rows
+    ]
+
+
+def save_rings(rings: list[dict], db_path: str | None = None) -> None:
+    """Persist `find_wash_rings` output from the latest pipeline run."""
+    if not rings:
+        return
+    init_db(db_path)
+    ts = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO wash_rings
+                (accounts_json, total_volume, cycle_volume, avg_trade_count,
+                 timing_tightness, truncated, detected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    json.dumps(r.get("accounts", [])),
+                    float(r.get("total_volume", 0.0)),
+                    float(r.get("cycle_volume", 0.0)),
+                    float(r.get("avg_trade_count", 0.0)),
+                    float(r.get("timing_tightness", 0.0)),
+                    int(bool(r.get("truncated", False))),
+                    ts,
+                )
+                for r in rings
+            ],
+        )
+        conn.commit()
+
+
+def get_rings(
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return detected wash-trading rings, most recent first, paginated."""
+    init_db(db_path)
+    query = (
+        "SELECT accounts_json, total_volume, cycle_volume, avg_trade_count, "
+        "timing_tightness, truncated, detected_at FROM wash_rings ORDER BY detected_at DESC"
+    )
+    params: list = []
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "accounts": json.loads(row[0]),
+            "total_volume": row[1],
+            "cycle_volume": row[2],
+            "avg_trade_count": row[3],
+            "timing_tightness": row[4],
+            "truncated": bool(row[5]),
+            "detected_at": row[6],
+        }
+        for row in rows
+    ]
+
+
+def save_feature_state(state, db_path: str | None = None) -> None:
+    """Persist a WalletFeatureState to cold storage (SQLite).
+
+    Args:
+        state: WalletFeatureState instance to persist.
+        db_path: Optional database path; uses settings.db_path if not provided.
+    """
+    init_db(db_path)
+    state_json = state.model_dump_json()
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO wallet_feature_states
+                (wallet, asset_pair, state_json, last_updated)
+            VALUES (?, ?, ?, ?)
+            """,
+            (state.wallet, state.asset_pair, state_json, state.last_updated.isoformat()),
+        )
+        conn.commit()
+
+
+def get_feature_state(wallet: str, asset_pair: str, db_path: str | None = None):
+    """Retrieve a WalletFeatureState from cold storage.
+
+    Returns None if not found.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT state_json FROM wallet_feature_states WHERE wallet = ? AND asset_pair = ?",
+            (wallet, asset_pair),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    from detection.feature_store import WalletFeatureState
+    return WalletFeatureState.model_validate_json(row[0])
+
+
+def promote_cold_to_hot(feature_store, batch_size: int = 100, db_path: str | None = None) -> int:
+    """Load most recently updated feature states from cold storage and write to Redis.
+
+    Returns the count of states promoted.
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT state_json FROM wallet_feature_states
+            ORDER BY last_updated DESC
+            LIMIT ?
+            """,
+            (batch_size,),
+        ).fetchall()
+
+    count = 0
+    from detection.feature_store import WalletFeatureState
+    for row in rows:
+        try:
+            state = WalletFeatureState.model_validate_json(row[0])
+            feature_store.set_state(state)
+            count += 1
+        except Exception as e:
+            logger.error(f"Error promoting feature state: {e}")
+
+    return count
+
+
+def save_bridge_transfer(transfer: BridgeTransfer, db_path: str | None = None) -> None:
+    """Persist a single bridge transfer record."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO bridge_transfers
+                (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                 tx_hash_evm, tx_hash_stellar, timestamp,
+                 canonical_hash, verification_status, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transfer.chain,
+                transfer.direction,
+                transfer.evm_wallet,
+                transfer.stellar_wallet,
+                transfer.amount_usd,
+                transfer.token,
+                transfer.tx_hash_evm,
+                transfer.tx_hash_stellar,
+                transfer.timestamp.isoformat(),
+                transfer.canonical_hash,
+                transfer.verification_status,
+                transfer.verified_at.isoformat() if transfer.verified_at else None,
+            ),
+        )
+        conn.commit()
+
+
+def save_bridge_transfers(transfers: list[BridgeTransfer], db_path: str | None = None) -> None:
+    """Persist a batch of bridge transfer records."""
+    if not transfers:
+        return
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO bridge_transfers
+                (chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                 tx_hash_evm, tx_hash_stellar, timestamp,
+                 canonical_hash, verification_status, verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    t.chain,
+                    t.direction,
+                    t.evm_wallet,
+                    t.stellar_wallet,
+                    t.amount_usd,
+                    t.token,
+                    t.tx_hash_evm,
+                    t.tx_hash_stellar,
+                    t.timestamp.isoformat(),
+                    t.canonical_hash,
+                    t.verification_status,
+                    t.verified_at.isoformat() if t.verified_at else None,
+                )
+                for t in transfers
+            ],
+        )
+        conn.commit()
+
+
+def get_bridge_transfers(
+    stellar_wallet: str | None = None,
+    evm_wallet: str | None = None,
+    since_days: int = 90,
+    db_path: str | None = None,
+) -> list[BridgeTransfer]:
+    """Return bridge transfers filtered by wallet and recency."""
+    init_db(db_path)
+    from datetime import timedelta
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    conditions = ["timestamp >= ?"]
+    params: list = [cutoff]
+    if stellar_wallet is not None:
+        conditions.append("stellar_wallet = ?")
+        params.append(stellar_wallet)
+    if evm_wallet is not None:
+        conditions.append("evm_wallet = ?")
+        params.append(evm_wallet)
+
+    where = " AND ".join(conditions)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                   tx_hash_evm, tx_hash_stellar, timestamp,
+                   canonical_hash, verification_status, verified_at
+            FROM bridge_transfers
+            WHERE {where}
+            ORDER BY timestamp DESC
+            """,
+            tuple(params),
+        ).fetchall()
+
+    return [
+        BridgeTransfer(
+            chain=row[0],
+            direction=row[1],
+            evm_wallet=row[2],
+            stellar_wallet=row[3],
+            amount_usd=row[4],
+            token=row[5],
+            tx_hash_evm=row[6],
+            tx_hash_stellar=row[7],
+            timestamp=datetime.fromisoformat(row[8]),
+            canonical_hash=row[9],
+            verification_status=row[10] if row[10] is not None else "disabled",
+            verified_at=datetime.fromisoformat(row[11]) if row[11] else None,
+        )
+        for row in rows
+    ]
+
+
+def get_bridge_transfer_history(
+    stellar_wallet: str,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the full bridge transfer history for a Stellar wallet as dicts."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT chain, direction, evm_wallet, stellar_wallet, amount_usd, token,
+                   tx_hash_evm, tx_hash_stellar, timestamp
+            FROM bridge_transfers
+            WHERE stellar_wallet = ?
+            ORDER BY timestamp DESC
+            """,
+            (stellar_wallet,),
+        ).fetchall()
+
+    return [
+        {
+            "chain": row[0],
+            "direction": row[1],
+            "evm_wallet": row[2],
+            "stellar_wallet": row[3],
+            "amount_usd_estimate": row[4],
+            "token": row[5],
+            "tx_hash_evm": row[6],
+            "tx_hash_stellar": row[7],
+            "timestamp": row[8],
+        }
+        for row in rows
+    ]
+
+
+def sandwich_candidates_to_alerts(candidates, asset_pair: str) -> list[dict]:
+    """Convert `SandwichCandidate` objects into storable alert dicts.
+
+    Each alert is attributed to the attacker account (`wallet`) and carries the
+    sandwich-specific evidence (victim, profit, slippage, ledger ordering) in
+    its ``detail`` payload.  See `detection.sandwich_engine`.
+    """
+    alerts: list[dict] = []
+    for c in candidates:
+        alerts.append(
+            {
+                "alert_type": AlertType.SANDWICH_ATTACK.value,
+                "wallet": c.attacker,
+                "asset_pair": asset_pair,
+                "pool_id": c.pool_id,
+                "detail": {
+                    "victim": c.victim,
+                    "profit_xlm": c.profit_xlm,
+                    "slippage_inflicted": c.slippage_inflicted,
+                    "ledger_sequence": c.ledger_sequence,
+                    "buy_op_idx": c.buy_op_idx,
+                    "victim_op_idx": c.victim_op_idx,
+                    "sell_op_idx": c.sell_op_idx,
+                },
+            }
+        )
+    return alerts
+
+
+def save_alerts(alerts: list[dict], db_path: str | None = None) -> None:
+    """Persist typed manipulation alerts.
+
+    Each alert dict must carry ``alert_type``, ``wallet``, ``asset_pair`` and a
+    JSON-serialisable ``detail`` mapping; ``pool_id`` and ``timestamp`` (ISO 8601)
+    are optional and default to ``None`` / now.
+
+    Suppressed wallets are silently dropped before persistence (Issue #178).
+    """
+    if not alerts:
+        return
+    from detection.suppressions import filter_suppressed_alerts
+    alerts = filter_suppressed_alerts(alerts, db_path=db_path)
+    if not alerts:
+        return
+    init_db(db_path)
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        conn.executemany(
+            """
+            INSERT INTO alerts
+                (alert_type, wallet, asset_pair, pool_id, detail_json, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    a["alert_type"],
+                    a["wallet"],
+                    a["asset_pair"],
+                    a.get("pool_id"),
+                    json.dumps(a.get("detail", {})),
+                    a.get("timestamp", now),
+                )
+                for a in alerts
+            ],
+        )
+        conn.commit()
+
+
+def get_alerts(
+    alert_type: str | None = None,
+    wallet: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return stored typed alerts, most recent first, with optional filters.
+
+    Filters by ``alert_type``, ``wallet`` and an inclusive ``[start, end]`` ISO
+    8601 timestamp window when provided.  ``detail`` is returned parsed.
+    """
+    init_db(db_path)
+    conditions: list[str] = []
+    params: list = []
+    if alert_type is not None:
+        conditions.append("alert_type = ?")
+        params.append(getattr(alert_type, "value", alert_type))
+    if wallet is not None:
+        conditions.append("wallet = ?")
+        params.append(wallet)
+    if start is not None:
+        conditions.append("timestamp >= ?")
+        params.append(start)
+    if end is not None:
+        conditions.append("timestamp <= ?")
+        params.append(end)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    query = f"""
+        SELECT alert_type, wallet, asset_pair, pool_id, detail_json, timestamp
+        FROM alerts
+        {where}
+        ORDER BY timestamp DESC, id DESC
+    """
+    if limit is not None:
+        query += " LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+
+    return [
+        {
+            "alert_type": row[0],
+            "wallet": row[1],
+            "asset_pair": row[2],
+            "pool_id": row[3],
+            "detail": json.loads(row[4]) if row[4] else {},
+            "timestamp": row[5],
+        }
+        for row in rows
+    ]
+
+
+def get_score_history(
+    wallet: str,
+    start: str,
+    end: str,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the risk-score time series for ``wallet`` within ``[start, end]``.
+
+    ``start`` and ``end`` are inclusive ISO 8601 timestamps.  Rows are ordered
+    oldest-first so the result reads as a chronological series, as required by
+    the regulatory export layer (`detection.compliance_exporter`).
+    """
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT wallet, asset_pair, score, benford_flag, ml_flag, confidence, timestamp
+            FROM risk_scores
+            WHERE wallet = ? AND timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC, id ASC
+            """,
+            (wallet, start, end),
+        ).fetchall()
+
+    return [
+        {
+            "wallet": row[0],
+            "asset_pair": row[1],
+            "score": row[2],
+            "benford_flag": bool(row[3]),
+            "ml_flag": bool(row[4]),
+            "confidence": row[5],
+            "timestamp": row[6],
+        }
+        for row in rows
+    ]
+
+
+def save_hop_payment_cycles(
+    cycles: list,
+    db_path: str | None = None,
+) -> None:
+    """Persist PathPaymentCycle records to the hop_payment_cycles table."""
+    import dataclasses
+    init_db(db_path)
+    if not cycles:
+        return
+    with _connect(db_path) as conn:
+        for cycle in cycles:
+            hops = [
+                {
+                    "src_wallet": h.src_wallet,
+                    "src_asset": h.src_asset,
+                    "dst_wallet": h.dst_wallet,
+                    "dst_asset": h.dst_asset,
+                    "amount": h.amount,
+                    "ledger_timestamp": h.ledger_timestamp.isoformat(),
+                    "operation_id": h.operation_id,
+                }
+                for h in cycle.hops
+            ]
+            conn.execute(
+                """
+                INSERT INTO hop_payment_cycles
+                    (origin_wallet, origin_asset, path_length, recovery_ratio,
+                     cycle_duration_seconds, counterparty_overlap, cycle_score,
+                     hop_json, detected_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cycle.origin_wallet,
+                    cycle.origin_asset,
+                    cycle.path_length,
+                    cycle.recovery_ratio,
+                    cycle.cycle_duration_seconds,
+                    cycle.counterparty_overlap,
+                    cycle.cycle_score,
+                    json.dumps(hops),
+                    cycle.detected_at.isoformat(),
+                ),
+            )
+        conn.commit()
+
+
+def get_hop_payment_cycles(
+    min_score: float = 0.6,
+    wallet: str | None = None,
+    limit: int = 100,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Retrieve PathPaymentCycle records from storage."""
+    init_db(db_path)
+    query = """
+        SELECT id, origin_wallet, origin_asset, path_length, recovery_ratio,
+               cycle_duration_seconds, counterparty_overlap, cycle_score,
+               hop_json, detected_at
+        FROM hop_payment_cycles
+        WHERE cycle_score >= ?
+    """
+    params: list = [min_score]
+    if wallet:
+        query += " AND origin_wallet = ?"
+        params.append(wallet)
+    query += " ORDER BY cycle_score DESC LIMIT ?"
+    params.append(limit)
+    with _connect(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [
+        {
+            "id": r[0],
+            "origin_wallet": r[1],
+            "origin_asset": r[2],
+            "path_length": r[3],
+            "recovery_ratio": r[4],
+            "cycle_duration_seconds": r[5],
+            "counterparty_overlap": r[6],
+            "cycle_score": r[7],
+            "hops": json.loads(r[8]),
+            "detected_at": r[9],
+        }
+        for r in rows
+    ]
+
+
+def log_krum_aggregation(
+    round_number: int,
+    n_clients: int,
+    f_tolerance: int,
+    m_selected: int,
+    selected_indices: list,
+    excluded_indices: list,
+    krum_scores: list,
+    db_path: str | None = None,
+) -> None:
+    """Persist one Krum aggregation round decision to fl_aggregation_log."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO fl_aggregation_log
+              (round_number, n_clients, f_tolerance, m_selected,
+               selected_indices, excluded_indices, krum_scores, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                round_number,
+                n_clients,
+                f_tolerance,
+                m_selected,
+                json.dumps(selected_indices),
+                json.dumps(excluded_indices),
+                json.dumps([float(s) for s in krum_scores]),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def get_krum_aggregation_log(
+    limit: int = 10,
+    db_path: str | None = None,
+) -> list[dict]:
+    """Return the most recent Krum aggregation rounds, newest first."""
+    init_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT round_number, n_clients, f_tolerance, m_selected,
+                   selected_indices, excluded_indices, krum_scores, recorded_at
+            FROM fl_aggregation_log
+            ORDER BY round_number DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "round_number": r[0],
+            "n_clients": r[1],
+            "f_tolerance": r[2],
+            "m_selected": r[3],
+            "selected_indices": json.loads(r[4]),
+            "excluded_indices": json.loads(r[5]),
+            "krum_scores": json.loads(r[6]),
+            "recorded_at": r[7],
+        }
+        for r in rows
     ]
 
 

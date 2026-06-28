@@ -17,6 +17,7 @@ venv/
 data/
 models/*.pkl
 models/*.joblib
+models/optuna_studies/
 
 # Local RiskScore store
 *.db
@@ -24,3 +25,6 @@ models/*.joblib
 # Editors
 .vscode/
 .idea/
+
+# Project specific
+somzilla.md
